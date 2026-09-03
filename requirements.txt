@@ -1,0 +1,12 @@
+streamlit
+langchain
+langchain-community
+langchain-anthropic
+langchain-openai
+langchain-chroma
+pypdf
+chromadb
+python-dotenv
+pdfplumber
+rank-bm25
+jieba

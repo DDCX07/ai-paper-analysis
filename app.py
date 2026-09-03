@@ -1,0 +1,671 @@
+# app.py
+# 文献阅读助手界面（Streamlit）：问答 / 概念图谱 / 自测出题 三个Tab
+# 支持多文献管理：可同时上传多篇PDF入库，检索/提取/出题均可按文献来源过滤
+import json
+import logging
+import threading
+import time
+
+import streamlit as st
+from streamlit.components.v1 import html as render_html
+
+# rag_core的调试日志（提取失败块的信息）输出到终端，方便排查
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+from rag_core import (
+    get_vectorstore,
+    list_sources,
+    add_pdf,
+    remove_source,
+    get_hybrid_retriever,
+    answer_question,
+    extract_concepts,
+    generate_quiz,
+    generate_paper_summary,
+)
+
+# --- 页面配置 ---
+st.set_page_config(page_title="📚 文献阅读助手", layout="wide")  # 铺满浏览器宽度，去掉两侧大留白
+st.title("📚 文献阅读助手")
+st.markdown("上传PDF文献（可多篇），提问、看概念、做自测。知识库持久化保存，重启后无需重新上传。")
+
+# --- 初始化session state ---
+DEFAULT_STATE = {
+    "vectorstore": None,
+    "sources": [],            # 库中全部文献名
+    "selected_sources": [],   # 当前勾选的文献过滤范围（空=全部）
+    "retriever": None,        # 混合检索器缓存（随过滤范围重建）
+    "retriever_key": None,    # 构建当前检索器时用的过滤范围
+    "messages": [],           # 多轮对话历史 [{"role", "content", "docs"?}]
+    "concepts": [],           # [{name, definition, category}]
+    "relations": [],          # [{subject, predicate, object}]
+    "quiz": None,             # QuizQuestion对象
+    "summary": None,          # 读论文模式的结构化摘要缓存
+    "pending_question": None, # 概念图谱联动：待送入问答的问题
+}
+for k, v in DEFAULT_STATE.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# 持久化向量库：启动时直接打开磁盘上的chroma_db目录，之前入库的文献都在
+if st.session_state.vectorstore is None:
+    st.session_state.vectorstore = get_vectorstore()
+    st.session_state.sources = list_sources(st.session_state.vectorstore)
+
+
+def invalidate_cached_results():
+    """文献库内容变化（新增/删除/切换过滤范围）后，旧的问答、概念、题目全部作废。"""
+    st.session_state.retriever = None
+    st.session_state.retriever_key = None
+    st.session_state.messages = []  # 检索范围变了，旧对话历史不再成立
+    st.session_state.concepts = []
+    st.session_state.relations = []
+    st.session_state.quiz = None
+    st.session_state.summary = None
+
+
+def make_progress_bar(label="准备中..."):
+    """创建进度条和真实进度回调（适用于有分步/分块结构的长任务）。"""
+    bar = st.progress(0.0, text=label)
+
+    def callback(fraction, message):
+        bar.progress(min(max(float(fraction), 0.0), 1.0), text=message)
+
+    return bar, callback
+
+
+def run_with_progress_bar(fn, label):
+    """执行单次LLM调用类任务（没有可回报的中间进度）。
+
+    在后台线程跑任务，主线程让进度条缓步推进，跑完立即拉满并返回结果；
+    出错时把异常抛回调用方，由外层 st.error 展示。
+    """
+    bar = st.progress(0.0, text=label)
+    holder = {}
+
+    def worker():
+        try:
+            holder["value"] = fn()
+        except Exception as e:
+            holder["error"] = e
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+    fraction = 0.05
+    while thread.is_alive():
+        bar.progress(min(fraction, 0.95), text=label)
+        fraction += 0.03
+        time.sleep(1.0)
+
+    thread.join()
+    if "error" in holder:
+        bar.progress(1.0, text=f"{label} — 失败")
+        raise holder["error"]
+    bar.progress(1.0, text=f"{label} — 完成！")
+    return holder["value"]
+
+
+def format_node_label(name):
+    """节点标签排版：英文术语和中文译名拆成两行，如
+    'self-attention（自注意力）' -> 'self-attention<br/>自注意力'。"""
+    safe = name.replace('"', "'")
+    if "（" in safe and safe.endswith("）"):
+        en, _, rest = safe.partition("（")
+        return f"{en}<br/>{rest[:-1]}"
+    return safe
+
+
+# 主题分类配色（浅色填充 + 深色描边），循环使用
+CATEGORY_PALETTE = [
+    ("#eaf3fc", "#5b8fc9"),  # 蓝
+    ("#e8f6ec", "#5ea575"),  # 绿
+    ("#fdf3e0", "#d29a3a"),  # 橙黄
+    ("#f3ecfa", "#9a72c4"),  # 紫
+    ("#fdeaea", "#cd6a6a"),  # 红
+    ("#eaf7f6", "#4fa8a2"),  # 青
+    ("#f5f0e6", "#a68b5b"),  # 棕
+    ("#eef0f4", "#7d8aa0"),  # 灰
+]
+
+
+def shorten_predicate(pred):
+    """边标签显示用的短关系词：去掉括号补充说明，超长截断。"""
+    import re
+
+    p = re.sub(r"（[^）]*）", "", pred).strip() or pred
+    if len(p) > 6:
+        p = p[:6] + "…"
+    return p
+
+
+def build_mermaid_chart(concepts, relations):
+    """把概念与关系转成mermaid flowchart代码。
+
+    返回 {
+      "chart": mermaid代码,
+      "cat_colors": {主题: (填充色, 描边色)},   # 供图例使用
+      "edge_defs": {短关系词: 完整关系词},      # 供边悬停提示使用
+    }
+    """
+    known = {c["name"]: c for c in concepts}
+    known_lower = {name.lower(): c for name, c in known.items()}
+
+    def resolve(name):
+        # 优先精确匹配，退而求其次大小写不敏感匹配
+        return known.get(name) or known_lower.get(name.lower()) or {
+            "name": name, "category": "未分类", "definition": ""
+        }
+
+    # 连接度：连接越多的概念越核心
+    degree = {}
+    for r in relations:
+        for n in (r["subject"], r["object"]):
+            degree[n] = degree.get(n, 0) + 1
+
+    # 主题 -> 配色序号
+    cat_colors = {}
+    def cat_class(category):
+        if category not in cat_colors:
+            fill, border = CATEGORY_PALETTE[len(cat_colors) % len(CATEGORY_PALETTE)]
+            cat_colors[category] = (fill, border)
+        return f"cat{list(cat_colors).index(category)}"
+
+    node_ids = {}
+    node_class = {}
+    lines = ["flowchart LR"]  # 横向布局：概念从左往右展开，长术语标签不吃垂直空间
+    for r in relations:
+        for name in (r["subject"], r["object"]):
+            if name not in node_ids:
+                node_ids[name] = f"N{len(node_ids)}"
+                concept = resolve(name)
+                label = format_node_label(concept["name"])
+                lines.append(f'    {node_ids[name]}("{label}")')
+                classes = [cat_class(concept.get("category", "未分类"))]
+                if degree.get(name, 0) >= 3:
+                    classes.append("core")  # 核心概念：加粗放大
+                elif degree.get(name, 0) <= 1:
+                    classes.append("minor")  # 边缘概念：缩小淡化
+                node_class[node_ids[name]] = classes
+    for r in relations:
+        pred = r["predicate"].replace('"', "'")
+        # 用引号包裹的管道形式，容错性最好（关系名带括号等特殊字符也能解析）
+        lines.append(f'    {node_ids[r["subject"]]} -->|"{shorten_predicate(pred)}"| {node_ids[r["object"]]}')
+
+    # 样式与类分配
+    for i, (category, (fill, border)) in enumerate(cat_colors.items()):
+        lines.append(f'    classDef cat{i} fill:{fill},stroke:{border},stroke-width:1.5px,color:#1f2d3d;')
+    lines.append('    classDef core font-size:17px,font-weight:bold,stroke-width:3.5px;')
+    lines.append('    classDef minor font-size:13px,opacity:0.85;')
+    for nid, classes in node_class.items():
+        lines.append(f'    class {nid} {",".join(classes)};')
+
+    # 完整关系词 -> 悬停提示映射（显示的是截断后的短词）
+    edge_defs = {}
+    for r in relations:
+        short = shorten_predicate(r["predicate"])
+        if short != r["predicate"]:
+            import re
+            edge_defs[re.sub(r"\s+", "", short)] = f"完整关系：{r['predicate']}"
+
+    return {"chart": "\n".join(lines), "cat_colors": cat_colors, "edge_defs": edge_defs}
+
+
+def render_mermaid(chart, concept_defs=None, edge_defs=None):
+    """在页面中渲染mermaid图，带缩放/全屏工具栏和悬停讲解。
+
+    concept_defs: {概念名: 定义}。鼠标悬停在节点上时弹出对应定义卡片。
+    edge_defs: {短关系词: 完整关系说明}。鼠标悬停在边上时弹出完整关系。
+    CDN用npmmirror（国内实测比jsdelivr快一个量级）。
+    """
+    n_nodes = max(chart.count('("'), 1)
+    height = min(320 + 90 * n_nodes, 1200)
+
+    # JS里用 textContent 去掉空白后匹配节点/边，这里预先算好每个概念的key
+    import re
+
+    defs = {}
+    for name, definition in (concept_defs or {}).items():
+        label = format_node_label(name)
+        key = re.sub(r"\s+", "", label.replace("<br/>", ""))
+        defs[key] = definition
+
+    # JSON在f-string外先算好：f-string表达式里写{}会被误解析为集合字面量
+    defs_json = json.dumps(defs, ensure_ascii=False)
+    edge_defs_json = json.dumps(edge_defs or {}, ensure_ascii=False)
+
+    render_html(
+        f"""
+<style>
+  #cgraph-wrap {{ height: 100%; overflow: auto; border: 1px solid #eee; border-radius: 8px;
+                  background: #fafbfc; cursor: grab; }}
+  #cgraph-wrap.dragging {{ cursor: grabbing; }}
+  #cgraph {{ transform-origin: top left; padding: 12px; }}
+  #cgraph svg {{ width: 100%; height: 100%; }}
+  .cg-toolbar {{ position: sticky; top: 6px; margin-left: 6px; z-index: 10; width: fit-content;
+                background: #fff; border: 1px solid #d9e2ec; border-radius: 6px;
+                box-shadow: 0 1px 4px rgba(0,0,0,.12); display: flex; }}
+  .cg-toolbar button {{ border: none; background: none; padding: 4px 10px; cursor: pointer;
+                       font-size: 14px; color: #24425c; }}
+  .cg-toolbar button:hover {{ background: #eef3f8; }}
+  .cg-toolbar span {{ padding: 4px 6px; font-size: 12px; color: #667; min-width: 38px; text-align: center; }}
+  #cgraph-tip {{ position: fixed; display: none; max-width: 320px; padding: 10px 12px;
+                 background: #24425c; color: #fff; font-size: 13px; line-height: 1.6;
+                 border-radius: 8px; box-shadow: 0 4px 14px rgba(0,0,0,.25); z-index: 99;
+                 pointer-events: none; }}
+</style>
+<div class="cg-toolbar">
+  <button id="zout" title="缩小">－</button>
+  <span id="zlevel">100%</span>
+  <button id="zin" title="放大">＋</button>
+  <button id="zreset" title="重置">重置</button>
+  <button id="zfull" title="全屏查看">⛶ 全屏</button>
+  <button id="zpng" title="导出PNG图片">📷 PNG</button>
+</div>
+<div id="cgraph-wrap"><div id="cgraph"></div></div>
+<div id="cgraph-tip"></div>
+<script type="module">
+  import mermaid from 'https://registry.npmmirror.com/mermaid/11.4.1/files/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({{
+    startOnLoad: false,
+    theme: 'base',
+    flowchart: {{ nodeSpacing: 75, rankSpacing: 95, padding: 14, curve: 'basis',
+                  htmlLabels: false }},  // SVG原生text标签：PNG导出时才不会变空白
+    themeVariables: {{
+      fontSize: '15px',
+      primaryColor: '#eaf3fc',
+      primaryBorderColor: '#5b8fc9',
+      primaryTextColor: '#1f2d3d',
+      lineColor: '#8aa2b8',
+      edgeLabelBackground: '#ffffff',
+    }},
+  }});
+  const defs = {defs_json};
+  const edgeDefs = {edge_defs_json};
+  const tip = document.getElementById('cgraph-tip');
+  const wrap = document.getElementById('cgraph-wrap');
+  const inner = document.getElementById('cgraph');
+
+  function showTip(text, e) {{
+    tip.textContent = text;
+    tip.style.display = 'block';
+    const w = Math.min(tip.offsetWidth, 320);
+    tip.style.left = Math.min(e.clientX + 16, window.innerWidth - w - 10) + 'px';
+    tip.style.top = (e.clientY + 16) + 'px';
+  }}
+  function hideTip() {{ tip.style.display = 'none'; }}
+
+  try {{
+    const {{ svg }} = await mermaid.render('cgraph1', {json.dumps(chart)});
+    inner.innerHTML = svg;
+    const svgEl = inner.querySelector('svg');
+
+    // ---- 缩放与平移 ----
+    const bb = svgEl.getBBox();
+    let scale = 1;
+    function apply() {{
+      inner.style.width = bb.width * scale + 'px';
+      inner.style.height = bb.height * scale + 'px';
+      document.getElementById('zlevel').textContent = Math.round(scale * 100) + '%';
+    }}
+    // 自适应铺满容器宽度（等同fit模式），窗口尺寸变化时重新适配
+    function fitWidth() {{
+      scale = Math.min(3, Math.max(0.4, (wrap.clientWidth - 26) / bb.width));
+      apply();
+    }}
+    fitWidth();
+    window.addEventListener('resize', fitWidth);
+    function zoomBy(f) {{ scale = Math.min(3, Math.max(0.5, scale * f)); apply(); }}
+    document.getElementById('zin').onclick = () => zoomBy(1.25);
+    document.getElementById('zout').onclick = () => zoomBy(0.8);
+    document.getElementById('zreset').onclick = () => {{ wrap.scrollTo(0, 0); fitWidth(); }};
+    wrap.addEventListener('wheel', e => {{
+      e.preventDefault();
+      zoomBy(e.deltaY < 0 ? 1.15 : 0.87);
+    }}, {{ passive: false }});
+    let down = null;
+    wrap.addEventListener('mousedown', e => {{
+      down = {{ x: e.clientX, y: e.clientY, l: wrap.scrollLeft, t: wrap.scrollTop }};
+      wrap.classList.add('dragging');
+    }});
+    window.addEventListener('mousemove', e => {{
+      if (!down) return;
+      wrap.scrollLeft = down.l - (e.clientX - down.x);
+      wrap.scrollTop = down.t - (e.clientY - down.y);
+    }});
+    window.addEventListener('mouseup', () => {{ down = null; wrap.classList.remove('dragging'); }});
+
+    // ---- 全屏 ----
+    document.getElementById('zfull').onclick = async () => {{
+      if (document.fullscreenElement) {{ document.exitFullscreen(); return; }}
+      try {{ await wrap.requestFullscreen(); }}
+      catch (err) {{
+        // iframe不允许真全屏时退化为页面内铺满
+        wrap.style.position = 'fixed'; wrap.style.inset = '0';
+        wrap.style.zIndex = 999; wrap.style.height = '100vh';
+      }}
+    }};
+    document.addEventListener('fullscreenchange', () => fitWidth());
+
+    // ---- 导出PNG：SVG序列化 -> Image -> 2倍分辨率canvas下载 ----
+    document.getElementById('zpng').onclick = async () => {{
+      const btn = document.getElementById('zpng');
+      const old = btn.textContent;
+      btn.textContent = '生成中...';
+      try {{
+        const clone = svgEl.cloneNode(true);
+        clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+        clone.setAttribute('width', bb.width);
+        clone.setAttribute('height', bb.height);
+        const xml = new XMLSerializer().serializeToString(clone);
+        const img = new Image();
+        await new Promise((res, rej) => {{
+          img.onload = res; img.onerror = () => rej(new Error('SVG转换失败'));
+          img.src = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(xml)));
+        }});
+        const pad = 24, scale = 2;  // 2倍分辨率保证清晰
+        const canvas = document.createElement('canvas');
+        canvas.width = (bb.width + pad * 2) * scale;
+        canvas.height = (bb.height + pad * 2) * scale;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, pad, pad, bb.width * scale, bb.height * scale);
+        const a = document.createElement('a');
+        a.download = '概念图谱.png';
+        a.href = canvas.toDataURL('image/png');
+        a.click();
+      }} catch (err) {{ alert('导出失败: ' + err.message); }}
+      btn.textContent = old;
+    }};
+
+    // ---- 悬停讲解：节点显示概念定义，边显示完整关系词 ----
+    svgEl.querySelectorAll('g.node').forEach(n => {{
+      const def = defs[n.textContent.replace(/\\s+/g, '')];
+      if (!def) return;
+      n.style.cursor = 'help';
+      n.addEventListener('mousemove', e => showTip(def, e));
+      n.addEventListener('mouseleave', hideTip);
+    }});
+    svgEl.querySelectorAll('g.edgeLabel').forEach(el => {{
+      const txt = edgeDefs[el.textContent.replace(/\\s+/g, '')];
+      if (!txt) return;
+      el.style.cursor = 'help';
+      el.addEventListener('mousemove', e => showTip(txt, e));
+      el.addEventListener('mouseleave', hideTip);
+    }});
+  }} catch (e) {{
+    inner.textContent = '图谱渲染失败: ' + e.message;
+  }}
+</script>
+""",
+        height=height,
+    )
+
+
+# --- 侧边栏：文献库管理与来源过滤 ---
+with st.sidebar:
+    st.header("📚 文献库")
+    st.caption(f"已入库：{len(st.session_state.sources)} 篇")
+    for s in st.session_state.sources:
+        st.markdown(f"- {s}")
+
+    st.divider()
+    st.header("1. 上传文献（可多选）")
+    uploaded_files = st.file_uploader("选择PDF文件", type="pdf", accept_multiple_files=True)
+    st.caption("模型：GLM / Embedding：智谱 embedding-3")
+
+    if uploaded_files:
+        if st.button("📥 处理并入库", use_container_width=True):
+            try:
+                invalidate_cached_results()
+                bar, callback = make_progress_bar("准备入库...")
+                total_chunks = 0
+                for i, f in enumerate(uploaded_files):
+                    # 多篇文件合成一条进度：第i篇的进度占比 = (i + 篇内进度) / 总篇数
+                    def scoped(frac, msg, idx=i, name=f.name):
+                        callback((idx + frac) / len(uploaded_files), f"[{name}] {msg}")
+
+                    total_chunks += add_pdf(
+                        st.session_state.vectorstore, f, f.name, progress_callback=scoped
+                    )
+                st.session_state.sources = list_sources(st.session_state.vectorstore)
+                bar.progress(1.0, text=f"✅ 完成！共入库 {total_chunks} 块")
+                st.success(f"✅ {len(uploaded_files)} 篇文献处理完成！")
+            except Exception as e:
+                st.error(f"处理失败: {e}")
+
+    # 管理文献：查看/删除已入库的单篇
+    with st.expander("🗑️ 管理文献"):
+        if st.session_state.sources:
+            victim = st.selectbox("选择要删除的文献:", st.session_state.sources)
+            if st.button("删除该文献", use_container_width=True):
+                remove_source(st.session_state.vectorstore, victim)
+                st.session_state.sources = list_sources(st.session_state.vectorstore)
+                invalidate_cached_results()
+                st.rerun()
+        else:
+            st.caption("文献库为空")
+
+    st.divider()
+    st.header("2. 检索范围")
+    selected = st.multiselect(
+        "按文献过滤（不选 = 检索全部）:",
+        options=st.session_state.sources,
+        default=st.session_state.selected_sources,
+    )
+    if selected != st.session_state.selected_sources:
+        st.session_state.selected_sources = selected
+        invalidate_cached_results()
+        st.rerun()
+
+# 库里一篇文献都没有时，先引导上传
+if not st.session_state.sources:
+    st.info("👈 请先在左侧上传PDF文献并点击「处理并入库」。知识库持久化保存，重启应用也不用重新上传。")
+    st.stop()
+
+filter_label = "、".join(st.session_state.selected_sources) if st.session_state.selected_sources else "全部文献"
+st.caption(f"当前检索范围：**{filter_label}**")
+
+# 检索范围变化时重建混合检索器（BM25索引随过滤范围变化，缓存避免每问重建）
+sources_key = tuple(st.session_state.selected_sources)
+if st.session_state.retriever is None or st.session_state.retriever_key != sources_key:
+    st.session_state.retriever = get_hybrid_retriever(
+        st.session_state.vectorstore, sources=list(st.session_state.selected_sources)
+    )
+    st.session_state.retriever_key = sources_key
+
+tab_summary, tab_qa, tab_concept, tab_quiz = st.tabs(
+    ["📋 论文速读", "📖 问答", "🧠 概念图谱", "📝 自测出题"]
+)
+
+# --- Tab 0: 论文速读（结构化摘要） ---
+with tab_summary:
+    st.caption("AI 通读全文（开头/中间/结尾均匀采样），生成 研究背景 / 核心创新点 / 方法论 / 实验结论 四段式摘要。")
+
+    if st.button("📝 生成结构化摘要", key="summary_btn"):
+        try:
+            st.session_state.summary = run_with_progress_bar(
+                lambda: generate_paper_summary(
+                    st.session_state.vectorstore,
+                    sources=list(st.session_state.selected_sources),
+                ),
+                "正在精读论文...",
+            )
+        except Exception as e:
+            st.error(f"摘要生成失败: {e}")
+
+    if st.session_state.summary:
+        st.markdown(st.session_state.summary)
+    else:
+        st.info("点击上方按钮，5-10 秒生成全文速读。切换检索范围后摘要会重新生成。")
+
+# --- Tab 1: 问答（多轮对话） ---
+with tab_qa:
+    st.caption("💬 支持追问：针对文献内容连续对话，模型会结合上下文理解“刚才那个公式”这类追问。")
+
+    # 概念图谱联动：把待提问的概念当作新消息处理
+    pending = st.session_state.pending_question
+    if pending:
+        st.session_state.messages.append({"role": "user", "content": pending})
+        st.session_state.pending_question = None
+
+    # 渲染完整对话历史（每次重跑都从session_state重绘，天然就是缓存）
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+            if msg["role"] == "assistant" and msg.get("docs"):
+                with st.expander("📖 引用原文"):
+                    for i, doc in enumerate(msg["docs"]):
+                        page = doc.metadata.get("page", "?")
+                        src = doc.metadata.get("source", "")
+                        label = f"第 {page + 1} 页" if isinstance(page, int) else f"第 {page} 页"
+                        st.markdown(f"**来源 {i + 1}** · {src} · {label}:")
+                        st.code(doc.page_content[:500])
+
+    # chat_input提交后rerun，把值存到session_state带进来；此处回答并落盘历史
+    new_query = st.session_state.pop("chat_input_value", None)
+    if new_query:
+        st.session_state.messages.append({"role": "user", "content": new_query})
+
+    if pending or new_query:
+        question = st.session_state.messages[-1]["content"]
+        with st.chat_message("assistant"):
+            try:
+                with st.spinner("正在思考..."):
+                    result = answer_question(
+                    st.session_state.vectorstore,
+                    question,
+                    history=st.session_state.messages[:-1],
+                    sources=list(st.session_state.selected_sources),
+                    retriever=st.session_state.retriever,
+                )
+                st.markdown(result["answer"])
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": result["answer"],
+                    "docs": result["source_documents"],
+                })
+            except Exception as e:
+                st.error(f"问答失败: {e}")
+
+# --- 底部输入框：st.chat_input只能放顶层，不能放进Tab内 ---
+if st.session_state.sources:
+    user_input = st.chat_input("针对文献内容提问，可连续追问...")
+    if user_input:
+        st.session_state.chat_input_value = user_input
+        st.rerun()  # 重跑后问答Tab处理这条新消息
+
+# --- Tab 2: 概念图谱 ---
+with tab_concept:
+    if st.button("🔍 提取陌生概念", key="extract_btn"):
+        try:
+            bar, callback = make_progress_bar("准备提取概念...")
+            res = extract_concepts(
+                st.session_state.vectorstore,
+                sources=list(st.session_state.selected_sources),
+                progress_callback=callback,
+            )
+            bar.progress(1.0, text="✅ 提取完成")
+            st.session_state.concepts = res["concepts"]
+            st.session_state.relations = res["relations"]
+            st.session_state.quiz = None  # 概念变了，旧题目作废
+            if res.get("skipped"):
+                st.warning(
+                    f"⚠️ 有 {len(res['skipped'])} 个文本块两次解析失败被跳过（详情见终端日志），"
+                    "核心概念可能不全。首块内容：\n\n> " + res["skipped"][0]["chunk_snippet"][:150]
+                )
+        except Exception as e:
+            st.error(f"提取失败: {e}")
+
+    if st.session_state.concepts:
+        if st.session_state.relations:
+            st.subheader(f"概念关系图（{len(st.session_state.relations)} 条关系）")
+            concept_defs = {c["name"]: c["definition"] for c in st.session_state.concepts}
+            built = build_mermaid_chart(st.session_state.concepts, st.session_state.relations)
+            render_mermaid(built["chart"], concept_defs=concept_defs, edge_defs=built["edge_defs"])
+
+            # 图例：主题分类配色说明
+            legend = "&nbsp;&nbsp;".join(
+                f'<span style="color:{border};font-size:18px;">●</span>'
+                f'<span style="color:#444;"> {cat}</span>'
+                for cat, (fill, border) in built["cat_colors"].items()
+            )
+            st.markdown(legend, unsafe_allow_html=True)
+            st.caption("💡 滚轮缩放 · 拖拽平移 · 悬停节点看定义 · 悬停边看完整关系 · 字体越大越核心")
+
+            # 概念 -> 问答联动：选一个概念直接去对话里深挖
+            link_concept = st.selectbox(
+                "💬 选一个概念，到「📖 问答」里深入讲解:",
+                ["（选择概念）"] + [c["name"] for c in st.session_state.concepts],
+                key="link_concept_select",
+            )
+            if link_concept != "（选择概念）" and st.button("去问答Tab详细讲解", key="link_ask_btn"):
+                st.session_state.pending_question = (
+                    f"请详细讲解概念「{link_concept}」：它在这篇文献里的含义、作用，"
+                    "以及和哪些概念相关，用大白话举例说明。"
+                )
+                st.rerun()
+
+        st.subheader(f"陌生概念（{len(st.session_state.concepts)} 个）")
+        for c in st.session_state.concepts:
+            with st.expander(f"**{c['name']}**"):
+                st.write(c["definition"])
+    else:
+        st.info("点击上方按钮，让AI通读文献并提取对初学者陌生的概念。")
+
+# --- Tab 3: 自测出题 ---
+with tab_quiz:
+    if not st.session_state.concepts:
+        st.info("请先在「🧠 概念图谱」Tab提取概念，然后在这里针对概念自测。")
+    else:
+        names = [c["name"] for c in st.session_state.concepts]
+        concept = st.selectbox("选择要考查的概念:", names)
+
+        if st.button("🎯 生成题目", key="quiz_btn"):
+            try:
+                definition = next(
+                    (c["definition"] for c in st.session_state.concepts if c["name"] == concept), ""
+                )
+                st.session_state.quiz = run_with_progress_bar(
+                    lambda: generate_quiz(
+                        st.session_state.vectorstore, concept, definition,
+                        sources=list(st.session_state.selected_sources),
+                    ),
+                    "正在出题...",
+                )
+                st.session_state.quiz_answered = False
+            except Exception as e:
+                st.error(f"出题失败: {e}")
+
+        quiz = st.session_state.quiz
+        if quiz is not None:
+            st.markdown(f"### 题目\n{quiz.question}")
+
+            choice = st.radio(
+                "选择你的答案:",
+                quiz.options,
+                key="quiz_choice",
+                index=None,
+                disabled=st.session_state.get("quiz_answered", False),
+            )
+
+            if not st.session_state.get("quiz_answered", False):
+                if st.button("提交答案") and choice is not None:
+                    st.session_state.quiz_answered = True
+                    st.rerun()
+
+            if st.session_state.get("quiz_answered", False):
+                if choice is None:
+                    # rerun后radio状态还在，重新取一次用户选择
+                    choice = st.session_state.get("quiz_choice")
+                correct = quiz.options[quiz.answer_index]
+                if choice == correct:
+                    st.success("✅ 回答正确！")
+                else:
+                    st.error(f"❌ 回答错误。正确答案是：{correct}")
+                st.info(f"**解析：** {quiz.explanation}")
+
+                if st.button("再做一题"):
+                    st.session_state.quiz = None
+                    st.session_state.quiz_answered = False
+                    st.rerun()
