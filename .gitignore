@@ -1,4 +1,6 @@
 .venv/
 .env
 chroma_db/
+artifacts/
+skills/
 __pycache__/

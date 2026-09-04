@@ -21,6 +21,9 @@ from rag_core import (
     extract_concepts,
     generate_quiz,
     generate_paper_summary,
+    save_artifact,
+    load_artifact,
+    delete_artifacts_for,
 )
 
 # --- 页面配置 ---
@@ -52,8 +55,8 @@ if st.session_state.vectorstore is None:
     st.session_state.sources = list_sources(st.session_state.vectorstore)
 
 
-def invalidate_cached_results():
-    """文献库内容变化（新增/删除/切换过滤范围）后，旧的问答、概念、题目全部作废。"""
+def clear_cached_results():
+    """清空全部派生结果（对话/摘要/概念/题目），文献库内容变化时用。"""
     st.session_state.retriever = None
     st.session_state.retriever_key = None
     st.session_state.messages = []  # 检索范围变了，旧对话历史不再成立
@@ -61,6 +64,17 @@ def invalidate_cached_results():
     st.session_state.relations = []
     st.session_state.quiz = None
     st.session_state.summary = None
+
+
+def invalidate_cached_results():
+    """检索范围变化后的结果切换：对话作废；摘要和概念图谱按范围落盘缓存，
+    有缓存就直接恢复（生成一次要1-2分钟，重启/切范围不该重来）。"""
+    clear_cached_results()
+    srcs = list(st.session_state.selected_sources)
+    graph = load_artifact("graph", srcs)
+    st.session_state.concepts = graph["concepts"] if graph else []
+    st.session_state.relations = graph["relations"] if graph else []
+    st.session_state.summary = load_artifact("summary", srcs)
 
 
 def make_progress_bar(label="准备中..."):
@@ -215,7 +229,8 @@ def render_mermaid(chart, concept_defs=None, edge_defs=None):
 
     concept_defs: {概念名: 定义}。鼠标悬停在节点上时弹出对应定义卡片。
     edge_defs: {短关系词: 完整关系说明}。鼠标悬停在边上时弹出完整关系。
-    CDN用npmmirror（国内实测比jsdelivr快一个量级）。
+    布局优先用ELK引擎（边交叉远少于默认dagre，参考GitDiagram），CDN不可达时自动退回dagre。
+    mermaid本体CDN用npmmirror（国内实测比jsdelivr快一个量级）。
     """
     n_nodes = max(chart.count('("'), 1)
     height = min(320 + 90 * n_nodes, 1200)
@@ -265,10 +280,13 @@ def render_mermaid(chart, concept_defs=None, edge_defs=None):
 <div id="cgraph-tip"></div>
 <script type="module">
   import mermaid from 'https://registry.npmmirror.com/mermaid/11.4.1/files/dist/mermaid.esm.min.mjs';
-  mermaid.initialize({{
+
+  const baseConfig = {{
     startOnLoad: false,
+    suppressErrorRendering: true,   // 解析失败时不让mermaid往页面里塞自带的报错图
+    securityLevel: 'antiscript',    // 概念名来自LLM输出，禁掉标签里可能夹带的脚本
     theme: 'base',
-    flowchart: {{ nodeSpacing: 75, rankSpacing: 95, padding: 14, curve: 'basis',
+    flowchart: {{ nodeSpacing: 75, rankSpacing: 95, padding: 14, curve: 'linear',
                   htmlLabels: false }},  // SVG原生text标签：PNG导出时才不会变空白
     themeVariables: {{
       fontSize: '15px',
@@ -278,7 +296,34 @@ def render_mermaid(chart, concept_defs=None, edge_defs=None):
       lineColor: '#8aa2b8',
       edgeLabelBackground: '#ffffff',
     }},
-  }});
+    themeCSS: `
+      /* 悬停反馈（参考GitDiagram）：轻微放大+压暗，提示"这个节点可以悬停看定义" */
+      g.node > * {{ transition: transform .16s ease, filter .16s ease;
+                    transform-box: fill-box; transform-origin: center; }}
+      @media (hover: hover) and (pointer: fine) {{
+        g.node:hover > * {{ transform: scale(1.05); filter: brightness(0.92); }}
+      }}
+      @media (prefers-reduced-motion: reduce) {{ g.node > * {{ transition: none; }} }}
+    `,
+  }};
+
+  // ELK布局引擎（GitDiagram同款）：比默认dagre的边交叉和绕线少得多，
+  // 概念多、关系密的图谱可读性差距明显。CDN上npmmirror不提供该包，
+  // 走jsdelivr；加载失败则静默退回dagre，图谱照样能画。
+  let useElk = false;
+  try {{
+    const elkLayouts = (await import(
+      'https://cdn.jsdelivr.net/npm/@mermaid-js/layout-elk@0.2.1/dist/mermaid-layout-elk.esm.min.mjs'
+    )).default;
+    mermaid.registerLayoutLoaders(elkLayouts);
+    useElk = true;
+  }} catch (err) {{ console.warn('ELK布局加载失败，使用默认dagre布局', err); }}
+
+  function mermaidConfig(withElk) {{
+    return withElk
+      ? {{ ...baseConfig, flowchart: {{ ...baseConfig.flowchart, defaultRenderer: 'elk' }} }}
+      : {{ ...baseConfig, flowchart: {{ ...baseConfig.flowchart, defaultRenderer: 'dagre' }} }};
+  }}
   const defs = {defs_json};
   const edgeDefs = {edge_defs_json};
   const tip = document.getElementById('cgraph-tip');
@@ -295,7 +340,17 @@ def render_mermaid(chart, concept_defs=None, edge_defs=None):
   function hideTip() {{ tip.style.display = 'none'; }}
 
   try {{
-    const {{ svg }} = await mermaid.render('cgraph1', {json.dumps(chart)});
+    let svg;
+    try {{
+      // 优先ELK；个别图ELK布局器可能溢出报错，退回dagre重画一次
+      mermaid.initialize(mermaidConfig(useElk));
+      ({{ svg }} = await mermaid.render('cgraph1', {json.dumps(chart)}));
+    }} catch (err) {{
+      if (!useElk) throw err;
+      console.warn('ELK渲染失败，回退dagre', err);
+      mermaid.initialize(mermaidConfig(false));
+      ({{ svg }} = await mermaid.render('cgraph2', {json.dumps(chart)}));
+    }}
     inner.innerHTML = svg;
     const svgEl = inner.querySelector('svg');
 
@@ -322,17 +377,20 @@ def render_mermaid(chart, concept_defs=None, edge_defs=None):
       e.preventDefault();
       zoomBy(e.deltaY < 0 ? 1.15 : 0.87);
     }}, {{ passive: false }});
+    // 拖拽平移：用Pointer事件，鼠标和平板触屏都能拖
     let down = null;
-    wrap.addEventListener('mousedown', e => {{
+    wrap.addEventListener('pointerdown', e => {{
       down = {{ x: e.clientX, y: e.clientY, l: wrap.scrollLeft, t: wrap.scrollTop }};
       wrap.classList.add('dragging');
     }});
-    window.addEventListener('mousemove', e => {{
+    window.addEventListener('pointermove', e => {{
       if (!down) return;
       wrap.scrollLeft = down.l - (e.clientX - down.x);
       wrap.scrollTop = down.t - (e.clientY - down.y);
     }});
-    window.addEventListener('mouseup', () => {{ down = null; wrap.classList.remove('dragging'); }});
+    window.addEventListener('pointerup', () => {{ down = null; wrap.classList.remove('dragging'); }});
+    // 触屏上接管手势（否则拖拽会被浏览器原生滚动抢走），鼠标端无感
+    wrap.style.touchAction = 'none';
 
     // ---- 全屏 ----
     document.getElementById('zfull').onclick = async () => {{
@@ -403,6 +461,11 @@ def render_mermaid(chart, concept_defs=None, edge_defs=None):
 
 
 # --- 侧边栏：文献库管理与来源过滤 ---
+# 每个会话第一次进入时，从磁盘恢复当前检索范围的摘要/概念图谱（之前生成过的话）
+if not st.session_state.get("artifacts_restored", False):
+    invalidate_cached_results()
+    st.session_state.artifacts_restored = True
+
 with st.sidebar:
     st.header("📚 文献库")
     st.caption(f"已入库：{len(st.session_state.sources)} 篇")
@@ -417,7 +480,9 @@ with st.sidebar:
     if uploaded_files:
         if st.button("📥 处理并入库", use_container_width=True):
             try:
-                invalidate_cached_results()
+                # 重新上传=替换内容：先把引用这些文献的旧摘要/图谱缓存删掉
+                delete_artifacts_for([f.name for f in uploaded_files])
+                clear_cached_results()
                 bar, callback = make_progress_bar("准备入库...")
                 total_chunks = 0
                 for i, f in enumerate(uploaded_files):
@@ -429,6 +494,7 @@ with st.sidebar:
                         st.session_state.vectorstore, f, f.name, progress_callback=scoped
                     )
                 st.session_state.sources = list_sources(st.session_state.vectorstore)
+                invalidate_cached_results()  # 尝试恢复与本次范围匹配的剩余缓存
                 bar.progress(1.0, text=f"✅ 完成！共入库 {total_chunks} 块")
                 st.success(f"✅ {len(uploaded_files)} 篇文献处理完成！")
             except Exception as e:
@@ -440,9 +506,43 @@ with st.sidebar:
             victim = st.selectbox("选择要删除的文献:", st.session_state.sources)
             if st.button("删除该文献", use_container_width=True):
                 remove_source(st.session_state.vectorstore, victim)
+                delete_artifacts_for([victim])  # 引用它的摘要/图谱缓存一并作废
                 st.session_state.sources = list_sources(st.session_state.vectorstore)
                 invalidate_cached_results()
                 st.rerun()
+        else:
+            st.caption("文献库为空")
+
+    # 查看文献：从向量库把入库文本按页拼回来，弥补"传完就看不到原文"的问题
+    with st.expander("📄 查看文献内容"):
+        if st.session_state.sources:
+            view_src = st.selectbox(
+                "选择文献:", st.session_state.sources, key="view_source"
+            )
+            data = st.session_state.vectorstore.get(
+                where={"source": view_src}, include=["documents", "metadatas"]
+            )
+            pages = {}
+            for d, m in zip(data.get("documents", []), data.get("metadatas", [])):
+                if d:
+                    pages.setdefault(m.get("page", 0) or 0, []).append(d.strip())
+            if not pages:
+                st.caption("该文献没有可展示的文本")
+            else:
+                page_nums = sorted(pages)
+                st.caption(f"共 {len(page_nums)} 页（按入库文本块拼回，公式/表格可能有少量失真）")
+                page_sel = st.selectbox(
+                    "跳到第几页:",
+                    [f"第 {p + 1} 页" for p in page_nums],
+                    key="view_page",
+                )
+                cur = page_nums[[f"第 {p + 1} 页" for p in page_nums].index(page_sel)]
+                st.text_area(
+                    "页面内容（可复制）",
+                    "\n\n".join(pages[cur]),
+                    height=360,
+                    key=f"view_page_{cur}",
+                )
         else:
             st.caption("文献库为空")
 
@@ -480,24 +580,25 @@ tab_summary, tab_qa, tab_concept, tab_quiz = st.tabs(
 
 # --- Tab 0: 论文速读（结构化摘要） ---
 with tab_summary:
-    st.caption("AI 通读全文（开头/中间/结尾均匀采样），生成 研究背景 / 核心创新点 / 方法论 / 实验结论 四段式摘要。")
+    st.caption("AI 通读全文（开头/中间/结尾均匀采样），生成 研究背景 / 核心创新点 / 方法论 / 实验结论 四段式摘要。生成结果自动保存在本地，重启应用或切换检索范围后再回来无需重新生成。")
 
     if st.button("📝 生成结构化摘要", key="summary_btn"):
         try:
+            # st.session_state只能在主线程访问：进后台线程前先把值取出来
+            vs = st.session_state.vectorstore
+            srcs = list(st.session_state.selected_sources)
             st.session_state.summary = run_with_progress_bar(
-                lambda: generate_paper_summary(
-                    st.session_state.vectorstore,
-                    sources=list(st.session_state.selected_sources),
-                ),
+                lambda: generate_paper_summary(vs, sources=srcs),
                 "正在精读论文...",
             )
+            save_artifact("summary", srcs, st.session_state.summary)  # 落盘，重启后仍可看
         except Exception as e:
             st.error(f"摘要生成失败: {e}")
 
     if st.session_state.summary:
         st.markdown(st.session_state.summary)
     else:
-        st.info("点击上方按钮，5-10 秒生成全文速读。切换检索范围后摘要会重新生成。")
+        st.info("点击上方按钮生成全文速读（模型会先深度思考，约需 1-2 分钟）。切换检索范围后摘要会重新生成。")
 
 # --- Tab 1: 问答（多轮对话） ---
 with tab_qa:
@@ -569,6 +670,12 @@ with tab_concept:
             st.session_state.concepts = res["concepts"]
             st.session_state.relations = res["relations"]
             st.session_state.quiz = None  # 概念变了，旧题目作废
+            # 落盘缓存：重启/切换检索范围后仍能直接查看，不必重新提取
+            save_artifact(
+                "graph",
+                list(st.session_state.selected_sources),
+                {"concepts": res["concepts"], "relations": res["relations"]},
+            )
             if res.get("skipped"):
                 st.warning(
                     f"⚠️ 有 {len(res['skipped'])} 个文本块两次解析失败被跳过（详情见终端日志），"
@@ -591,7 +698,7 @@ with tab_concept:
                 for cat, (fill, border) in built["cat_colors"].items()
             )
             st.markdown(legend, unsafe_allow_html=True)
-            st.caption("💡 滚轮缩放 · 拖拽平移 · 悬停节点看定义 · 悬停边看完整关系 · 字体越大越核心")
+            st.caption("💡 滚轮缩放 · 拖拽平移 · 悬停节点看定义 · 悬停边看完整关系 · 字体越大越核心 · 图谱自动保存，重启后仍可查看")
 
             # 概念 -> 问答联动：选一个概念直接去对话里深挖
             link_concept = st.selectbox(
@@ -626,11 +733,11 @@ with tab_quiz:
                 definition = next(
                     (c["definition"] for c in st.session_state.concepts if c["name"] == concept), ""
                 )
+                # 同上：session_state的值先取到局部变量再进后台线程
+                vs = st.session_state.vectorstore
+                srcs = list(st.session_state.selected_sources)
                 st.session_state.quiz = run_with_progress_bar(
-                    lambda: generate_quiz(
-                        st.session_state.vectorstore, concept, definition,
-                        sources=list(st.session_state.selected_sources),
-                    ),
+                    lambda: generate_quiz(vs, concept, definition, sources=srcs),
                     "正在出题...",
                 )
                 st.session_state.quiz_answered = False

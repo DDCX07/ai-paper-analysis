@@ -2,6 +2,7 @@
 # 核心RAG流水线：PDF加载 -> 分块 -> 向量化(智谱embedding-3) -> Chroma(持久化) -> 检索问答(GLM)
 # 扩展模块：口语化问答、概念与关系提取、自测出题、多文献管理与按来源过滤检索
 import json
+import hashlib
 import logging
 import os
 import re
@@ -73,17 +74,20 @@ def _get_embeddings() -> OpenAIEmbeddings:
 def _get_llm() -> ChatAnthropic:
     """GLM对话模型，走Anthropic兼容端点。
 
-    thinking设为disabled：GLM默认先输出一大段深度思考再回答，
-    单次调用耗时约为关闭时的3倍；本应用的任务不需要思考链。
+    智谱新策略：glm-5.3-flash始终思考，传disabled会报1210错误，
+    只能开思考并给最小budget（1024）压低延迟。
+    注意：thinking块本身能占到两三千token，max_tokens必须给足余量，
+    否则思考没结束就截断，text块为空。
+    返回内容里会多一个thinking块，各调用方统一用_msg_text取纯文本，不受影响。
     """
     return ChatAnthropic(
         model=LLM_MODEL,
         api_key=API_KEY,
         base_url=ANTHROPIC_BASE_URL,
-        max_tokens=4096,
+        max_tokens=16384,
         temperature=0.2,
         timeout=120,
-        thinking={"type": "disabled"},
+        thinking={"type": "enabled", "budget_tokens": 1024},
     )
 
 
@@ -211,6 +215,60 @@ def remove_source(vectorstore: Chroma, source_name: str) -> None:
     old = vectorstore.get(where={"source": source_name}, include=[])
     if old.get("ids"):
         vectorstore.delete(ids=old["ids"])
+
+
+# --- 生成结果的磁盘缓存（摘要 / 概念图谱，按检索范围存取） ---
+# 摘要和概念图谱生成很慢（GLM强制思考后单次要1-2分钟），而session_state一重启
+# 或切换检索范围就没了。这里把生成结果按检索范围落盘：同一范围再次打开时直接
+# 加载，不必重新花钱花时间生成。
+
+ARTIFACT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "artifacts")
+
+
+def _artifact_key(sources) -> str:
+    """检索范围 -> 稳定缓存键（排序后取md5；空列表表示'全部文献'范围）。"""
+    raw = "\n".join(sorted(s or "" for s in (sources or [])))
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def save_artifact(kind: str, sources, data) -> None:
+    """持久化一份生成结果。kind: 'summary'（结构化摘要）或 'graph'（概念+关系）。"""
+    os.makedirs(ARTIFACT_DIR, exist_ok=True)
+    payload = {"sources": sorted(sources or []), "kind": kind, "data": data}
+    path = os.path.join(ARTIFACT_DIR, f"{kind}_{_artifact_key(sources)}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+
+
+def load_artifact(kind: str, sources):
+    """读取对应检索范围的缓存结果；没有或文件损坏返回None。"""
+    path = os.path.join(ARTIFACT_DIR, f"{kind}_{_artifact_key(sources)}.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f).get("data")
+    except (OSError, ValueError) as e:
+        logger.warning("缓存文件读取失败 %s: %s", path, e)
+        return None
+
+
+def delete_artifacts_for(sources) -> None:
+    """文献被删除/重新上传后，所有引用它的缓存全部作废删除（防止新旧内容错配）。"""
+    if not os.path.isdir(ARTIFACT_DIR):
+        return
+    names = set(sources or [])
+    for fn in os.listdir(ARTIFACT_DIR):
+        if not fn.endswith(".json"):
+            continue
+        path = os.path.join(ARTIFACT_DIR, fn)
+        try:
+            with open(path, encoding="utf-8") as f:
+                stale = names & set(json.load(f).get("sources", []))
+        except (OSError, ValueError):
+            continue
+        if stale:
+            os.unlink(path)
 
 
 # --- 问答 ---
