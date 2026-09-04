@@ -152,6 +152,15 @@ def invalidate_cached_results():
     clear_cached_results()
     srcs = list(st.session_state.selected_sources)
     save_last_scope(srcs)  # 记住范围，新开浏览器界面时自动回到这里
+    # 范围同时写进URL：F5刷新后浏览器原样带着参数发回来，比服务端文件更可靠
+    # （多标签页/旧会话的文件写入可能互相覆盖），刷新后图谱就不会"丢"
+    try:
+        if srcs:
+            st.query_params["scope"] = srcs
+        elif "scope" in st.query_params:
+            del st.query_params["scope"]
+    except Exception:
+        pass  # 个别嵌入式环境不允许改URL，退回仅用文件记忆
     graph = load_artifact("graph", srcs)
     if graph is None and not srcs and len(st.session_state.sources) == 1:
         # “全部文献”范围没有自己的缓存、但库里只有一篇时，那篇的缓存就是全部内容的缓存
@@ -775,7 +784,14 @@ def render_summary_markdown(text):
 # 每个会话第一次进入时：先回到上次使用的检索范围（否则新开界面默认"全部文献"，
 # 而图谱是按范围保存的，范围对不上就会显示成没生成过），再恢复该范围的摘要/概念图谱
 if not st.session_state.get("artifacts_restored", False):
-    last = load_last_scope()
+    last = None
+    # 优先级1：URL里的范围参数（F5刷新后原样保留，最可靠）
+    qp = st.query_params.get_all("scope")
+    if qp and all(s in st.session_state.sources for s in qp):
+        last = qp
+    # 优先级2：服务端记录的上次范围
+    if last is None:
+        last = load_last_scope()
     valid = last is not None and all(s in st.session_state.sources for s in last)
     if not valid:
         # 没有有效范围记录（首次使用新版/记录失效）时，若恰好只有一个已保存图谱
@@ -790,6 +806,21 @@ if not st.session_state.get("artifacts_restored", False):
         st.session_state.selected_sources = last
     invalidate_cached_results()
     st.session_state.artifacts_restored = True
+    # 浏览器刷新后会自动恢复上次的滚动位置，页面直接落到底部，观感像"丢了"。
+    # 只在页面刚加载/刷新的几秒内拉回顶部（用父页面performance计时区分真刷新
+    # 与会话内rerun——rerun时本段不执行，点按钮不会把页面拽来拽去）
+    render_html(
+        "<script>(function(){"
+        "var go=function(){try{var w=window.parent,p=w.document;"
+        "if(!w.performance||w.performance.now()>5000)return;"
+        "w.history.scrollRestoration='manual';"
+        "if(p.activeElement&&p.activeElement.blur)p.activeElement.blur();"
+        "w.scrollTo(0,0);"
+        "var m=p.querySelector('section.main,[data-testid=stApp],[data-testid=stMain]');"
+        "if(m)m.scrollTop=0;}catch(e){}};"
+        "go();setTimeout(go,600);setTimeout(go,1800);})();</script>",
+        height=0,
+    )
 
 with st.sidebar:
     st.header("📚 文献库")
