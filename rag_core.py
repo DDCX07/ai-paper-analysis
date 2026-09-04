@@ -451,7 +451,7 @@ def extract_text(result: dict) -> str:
 class ExtractedConcept(BaseModel):
     """从文献中提取的单个概念。"""
     name: str = Field(description="概念/术语的名称，保留文献原文写法")
-    definition: str = Field(description="基于文献内容的初学者友好解释，不超过50字")
+    definition: str = Field(description="基于文献内容的初学者友好详细解释：说清它是什么、解决什么问题、在文献中的作用，最后举个通俗例子（用'比如：'开头），120-200字")
     category: str = Field(description="概念所属主题，从这些类别中选一个最贴切的：模型架构、算法机制、训练方法、数学工具、评价指标、应用任务、其他")
 
 
@@ -484,7 +484,9 @@ class QuizBatch(BaseModel):
 EXTRACT_PROMPT = """你是一位耐心的学术阅读导师。请从下面的文献片段中，提取出对初学者来说陌生的核心概念，
 以及这些概念之间的关系。要求：
 1. 只提取文献中真正出现的概念，不要自己编造；
-2. 概念解释要基于文献内容、面向初学者；
+2. 概念解释要基于文献内容、面向初学者，每个概念用120-200字详细讲：
+   先说清它是什么、解决什么问题，再说它在文献中的作用，最后必须举一个通俗例子
+   （用"比如："开头，可以是生活化的类比）。不要堆砌术语，零基础也要能读懂；
 3. 关系要明确、有信息量（例如"自注意力 依赖 缩放点积注意力"），关系词必须简短（不超过6个字）；
 4. 必须通过工具提交结果，不要用纯文本回答；
 5. 单个片段最多提取10个概念，选最重要的；
@@ -758,6 +760,124 @@ def _invoke_stream(llm, prompt):
     for chunk in llm.stream(prompt):
         agg = chunk if agg is None else agg + chunk
     return agg
+
+
+class EnrichedConcepts(BaseModel):
+    """概念解释的扩写结果：名称与分类保持不变，只重写definition。"""
+    concepts: list[ExtractedConcept] = Field(description="与输入一一对应的概念列表，顺序、名称、category均不变，仅definition被扩写")
+
+
+ENRICH_PROMPT = """你是一位耐心的学术阅读导师。下面是一份从文献中提取的概念清单，每个概念目前只有一句简短解释。
+请把每个概念的解释扩写得更详细，供读者在概念图谱里悬停查看。要求：
+1. 概念名称、category、数量、顺序都保持不变，不要增删概念，只改写definition；
+2. definition基于文献内容：先用1-2句话讲清它是什么、解决什么问题，再说明它在文献中
+   的作用（可结合"相关关系"提一下它和其他概念的联系）；
+3. 最后必须举一个通俗易懂的例子，用"比如："开头，用生活化类比帮零基础读者理解；
+4. 每个definition长度120-200字，口语化，不要堆砌术语。
+
+概念清单（JSON）：
+{concepts}
+
+相关关系：
+{relations}
+
+文献内容摘录：
+{context}"""
+
+
+def _parse_enriched(message):
+    """解析扩写结果：先工具调用，再从纯文本抢救JSON（与_parse_quiz_batch同思路）。"""
+    for tc in getattr(message, "tool_calls", None) or []:
+        args = tc.get("args") or {}
+        if args.get("concepts"):
+            try:
+                return EnrichedConcepts.model_validate(args)
+            except Exception:
+                logger.warning("工具参数无法解析为EnrichedConcepts，转纯文本抢救")
+                break
+    raw = _msg_text(message).strip()
+    if not raw:
+        return None
+    m = re.search(r"```(?:json)?\s*(.+?)```", raw, re.S)
+    if m:
+        raw = m.group(1)
+    try:
+        return EnrichedConcepts.model_validate(json.loads(raw))
+    except Exception:
+        m = re.search(r"(\{.*\})", raw, re.S)
+        if not m:
+            return None
+        try:
+            return EnrichedConcepts.model_validate(json.loads(m.group(1)))
+        except Exception:
+            return None
+
+
+def enrich_concept_definitions(vectorstore: Chroma, concepts, relations,
+                               sources=None, progress_callback=None) -> list:
+    """把已有图谱中过短的概念解释批量扩写（详细+举例），返回新的concepts列表。
+
+    只处理解释还不够长（<80字）的概念，已扩写过的直接跳过——中途失败后再点一次
+    按钮只需补漏，不用全部重来。概念多时单次调用输出会超max_tokens被截断，因此
+    分批（每批~10个）串行扩写；某批失败时该批概念保持原解释，不影响其他批。
+    """
+    def report(fraction, message):
+        if progress_callback:
+            progress_callback(min(max(fraction, 0.0), 1.0), message)
+
+    todo = [c for c in concepts if len(c.get("definition", "")) < 80]
+    if not todo:
+        report(1.0, "所有概念解释都已足够详细")
+        return list(concepts)
+
+    # 上下文：与摘要同思路，取当前范围的文本块清洗后拼接（够扩写参考即可，不求全）
+    data = vectorstore.get(where=_source_filter(sources), limit=8, include=["documents"])
+    ctx_parts = []
+    for t in data.get("documents", []):
+        cleaned = _clean_chunk_text(t or "")
+        if cleaned:
+            ctx_parts.append(cleaned)
+    context = "\n\n".join(ctx_parts)[:8000]
+
+    rel_text = "\n".join(f"{r['subject']} -{r['predicate']}-> {r['object']}" for r in (relations or []))
+    llm = _get_llm().bind_tools([EnrichedConcepts])
+
+    new_defs: dict[str, str] = {}
+    batch_size = 10
+    batches = [todo[i:i + batch_size] for i in range(0, len(todo), batch_size)]
+    for bi, batch in enumerate(batches):
+        report(bi / len(batches), f"扩写概念解释（第{bi + 1}/{len(batches)}批）...")
+        prompt = ENRICH_PROMPT.format(
+            concepts=json.dumps(
+                [{"name": c["name"], "definition": c["definition"], "category": c.get("category", "其他")}
+                 for c in batch],
+                ensure_ascii=False, indent=1),
+            relations=rel_text or "（无）",
+            context=context,
+        )
+        for attempt in range(2):
+            try:
+                res = _parse_enriched(_invoke_stream(llm, prompt))
+                if res:
+                    # 以名称为键取回扩写结果；模型偶发漏掉个别概念时该概念保持原解释
+                    for c in res.concepts:
+                        key = c.name.strip().lower()
+                        old = next((b["definition"] for b in batch if b["name"].strip().lower() == key), "")
+                        # 只接受真正变详细的结果（模型偶尔会原样抄回短解释）
+                        if c.definition.strip() and len(c.definition.strip()) >= len(old):
+                            new_defs[key] = c.definition.strip()
+                    break
+                logger.warning("第%d次扩写未得到结构化结果（批次%d）", attempt + 1, bi + 1)
+            except Exception as e:
+                logger.warning("第%d次扩写异常（批次%d）: %s", attempt + 1, bi + 1, str(e)[:200])
+
+    enriched = [dict(c) for c in concepts]
+    for c in enriched:
+        better = new_defs.get(c["name"].strip().lower())
+        if better:
+            c["definition"] = better
+    report(1.0, f"扩写完成：{len(new_defs)}/{len(todo)} 个概念被加长")
+    return enriched
 
 
 def _parse_quiz_batch(message):

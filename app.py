@@ -37,6 +37,7 @@ try:
         get_hybrid_retriever,
         answer_question,
         extract_concepts,
+        enrich_concept_definitions,
         generate_quiz_batch,
         generate_paper_summary,
         save_artifact,
@@ -372,10 +373,12 @@ def render_mermaid(chart, concept_defs=None, edge_defs=None):
                        font-size: 14px; color: var(--cg-tb-text); }}
   .cg-toolbar button:hover {{ background: var(--cg-tb-hover); }}
   .cg-toolbar span {{ padding: 4px 6px; font-size: 12px; color: var(--cg-tb-zoom); min-width: 38px; text-align: center; }}
-  #cgraph-tip {{ position: fixed; display: none; max-width: 320px; padding: 10px 12px;
-                 background: #24425c; color: #fff; font-size: 13px; line-height: 1.6;
+  #cgraph-tip {{ position: fixed; display: none; width: 380px; max-width: 90vw; padding: 10px 14px;
+                 background: #24425c; color: #fff; font-size: 13px; line-height: 1.7;
                  border-radius: 8px; box-shadow: 0 4px 14px rgba(0,0,0,.25); z-index: 99;
                  pointer-events: none; }}
+  .cgraph-tip-name {{ font-size: 14px; font-weight: 600; margin-bottom: 4px;
+                      color: #a8d4ff; }}
 </style>
 <div class="cg-toolbar">
   <button id="zout" title="缩小">－</button>
@@ -387,7 +390,7 @@ def render_mermaid(chart, concept_defs=None, edge_defs=None):
 </div>
 <div id="cgraph-wrap"><div id="cgraph"></div>
   <!-- 提示卡片必须放在wrap内部：全屏时浏览器只渲染全屏元素的子树，放在外面会消失 -->
-  <div id="cgraph-tip"></div>
+  <div id="cgraph-tip"><div class="cgraph-tip-name"></div><div class="cgraph-tip-body"></div></div>
 </div>
 <script type="module">
   // 优先加载本应用自托管的mermaid/ELK（/app/static，无外网依赖、秒加载），
@@ -517,12 +520,16 @@ def render_mermaid(chart, concept_defs=None, edge_defs=None):
   const wrap = document.getElementById('cgraph-wrap');
   const inner = document.getElementById('cgraph');
 
-  function showTip(text, e) {{
-    tip.textContent = text;
+  function showTip(title, text, e) {{
+    tip.querySelector('.cgraph-tip-name').textContent = title || '';
+    tip.querySelector('.cgraph-tip-name').style.display = title ? 'block' : 'none';
+    tip.querySelector('.cgraph-tip-body').textContent = text;
     tip.style.display = 'block';
-    const w = Math.min(tip.offsetWidth, 320);
-    tip.style.left = Math.min(e.clientX + 16, window.innerWidth - w - 10) + 'px';
-    tip.style.top = (e.clientY + 16) + 'px';
+    const w = tip.offsetWidth;
+    tip.style.left = Math.max(8, Math.min(e.clientX + 16, window.innerWidth - w - 10)) + 'px';
+    // 卡片变高了：靠下时翻转到鼠标上方，避免探出屏幕看不到后半段
+    const h = tip.offsetHeight;
+    tip.style.top = (e.clientY + 16 + h > window.innerHeight ? e.clientY - h - 10 : e.clientY + 16) + 'px';
   }}
   function hideTip() {{ tip.style.display = 'none'; }}
 
@@ -629,19 +636,19 @@ def render_mermaid(chart, concept_defs=None, edge_defs=None):
       btn.textContent = old;
     }};
 
-    // ---- 悬停讲解：节点显示概念定义，边显示完整关系词 ----
+    // ---- 悬停讲解：节点显示概念名+详细定义，边显示完整关系词 ----
     svgEl.querySelectorAll('g.node').forEach(n => {{
       const def = defs[n.textContent.replace(/\\s+/g, '')];
       if (!def) return;
       n.style.cursor = 'help';
-      n.addEventListener('mousemove', e => showTip(def, e));
+      n.addEventListener('mousemove', e => showTip(n.textContent.replace(/\\s+/g, ' '), def, e));
       n.addEventListener('mouseleave', hideTip);
     }});
     svgEl.querySelectorAll('g.edgeLabel').forEach(el => {{
       const txt = edgeDefs[el.textContent.replace(/\\s+/g, '')];
       if (!txt) return;
       el.style.cursor = 'help';
-      el.addEventListener('mousemove', e => showTip(txt, e));
+      el.addEventListener('mousemove', e => showTip('', txt, e));
       el.addEventListener('mouseleave', hideTip);
     }});
     }} catch (e) {{
@@ -1033,6 +1040,29 @@ with tab_concept:
                 )
         except Exception as e:
             st.error(f"提取失败: {e}")
+
+    if st.session_state.concepts and any(len(c.get("definition", "")) < 80 for c in st.session_state.concepts):
+        # 旧版提取的解释只有一句话；不想让用户重新提取整个图谱，提供一键扩写
+        if st.button("✍️ 扩写概念解释（更详细+举例，约1-2分钟）", key="enrich_btn"):
+            try:
+                bar, callback = make_progress_bar("准备扩写概念解释...")
+                new_concepts = enrich_concept_definitions(
+                    st.session_state.vectorstore,
+                    st.session_state.concepts,
+                    st.session_state.relations,
+                    sources=list(st.session_state.selected_sources),
+                    progress_callback=callback,
+                )
+                fade_out_progress(bar, "✅ 扩写完成")
+                st.session_state.concepts = new_concepts
+                save_artifact(
+                    "graph",
+                    list(st.session_state.selected_sources),
+                    {"concepts": new_concepts, "relations": st.session_state.relations},
+                )
+                st.rerun()
+            except Exception as e:
+                st.error(f"扩写失败: {e}")
 
     if st.session_state.concepts:
         if st.session_state.relations:
