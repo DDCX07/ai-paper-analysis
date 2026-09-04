@@ -268,6 +268,44 @@ def load_artifact(kind: str, sources):
         return None
 
 
+def list_artifacts(kind: str):
+    """列出某类已保存结果的来源范围（供UI提示"哪些文献已有图谱/摘要可看"）。"""
+    out = []
+    if not os.path.isdir(ARTIFACT_DIR):
+        return out
+    for fn in os.listdir(ARTIFACT_DIR):
+        if not fn.startswith(kind + "_") or not fn.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(ARTIFACT_DIR, fn), encoding="utf-8") as f:
+                out.append(sorted(json.load(f).get("sources", [])))
+        except (OSError, ValueError):
+            continue
+    return out
+
+
+_SCOPE_FILE = os.path.join(ARTIFACT_DIR, "_last_scope.json")
+
+
+def save_last_scope(sources) -> None:
+    """记住本次使用的检索范围，让新开的浏览器界面能自动回到同一篇文献。"""
+    try:
+        os.makedirs(ARTIFACT_DIR, exist_ok=True)
+        with open(_SCOPE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"sources": sorted(sources or [])}, f, ensure_ascii=False)
+    except OSError as e:
+        logger.warning("保存检索范围失败: %s", e)
+
+
+def load_last_scope():
+    """读取上次使用的检索范围；没有记录返回None。"""
+    try:
+        with open(_SCOPE_FILE, encoding="utf-8") as f:
+            return list(json.load(f).get("sources", []))
+    except (OSError, ValueError):
+        return None
+
+
 def delete_artifacts_for(sources) -> None:
     """文献被删除/重新上传后，所有引用它的缓存全部作废删除（防止新旧内容错配）。"""
     if not os.path.isdir(ARTIFACT_DIR):

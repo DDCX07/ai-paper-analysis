@@ -42,6 +42,9 @@ try:
         save_artifact,
         load_artifact,
         delete_artifacts_for,
+        list_artifacts,
+        save_last_scope,
+        load_last_scope,
     )
 except RuntimeError:
     # 首次使用者没配密钥时，rag_core会在导入时抛RuntimeError。
@@ -147,10 +150,17 @@ def invalidate_cached_results():
     有缓存就直接恢复（生成一次要1-2分钟，重启/切范围不该重来）。"""
     clear_cached_results()
     srcs = list(st.session_state.selected_sources)
+    save_last_scope(srcs)  # 记住范围，新开浏览器界面时自动回到这里
     graph = load_artifact("graph", srcs)
+    if graph is None and not srcs and len(st.session_state.sources) == 1:
+        # “全部文献”范围没有自己的缓存、但库里只有一篇时，那篇的缓存就是全部内容的缓存
+        graph = load_artifact("graph", [st.session_state.sources[0]])
     st.session_state.concepts = graph["concepts"] if graph else []
     st.session_state.relations = graph["relations"] if graph else []
-    st.session_state.summary = load_artifact("summary", srcs)
+    summary = load_artifact("summary", srcs)
+    if summary is None and not srcs and len(st.session_state.sources) == 1:
+        summary = load_artifact("summary", [st.session_state.sources[0]])
+    st.session_state.summary = summary
 
 
 def make_progress_bar(label="准备中..."):
@@ -755,8 +765,22 @@ def render_summary_markdown(text):
 
 
 # --- 侧边栏：文献库管理与来源过滤 ---
-# 每个会话第一次进入时，从磁盘恢复当前检索范围的摘要/概念图谱（之前生成过的话）
+# 每个会话第一次进入时：先回到上次使用的检索范围（否则新开界面默认"全部文献"，
+# 而图谱是按范围保存的，范围对不上就会显示成没生成过），再恢复该范围的摘要/概念图谱
 if not st.session_state.get("artifacts_restored", False):
+    last = load_last_scope()
+    valid = last is not None and all(s in st.session_state.sources for s in last)
+    if not valid:
+        # 没有有效范围记录（首次使用新版/记录失效）时，若恰好只有一个已保存图谱
+        # 的范围且其文献都还在库里，就直接回到那个范围——别让用户以为图谱丢了
+        saved = [
+            s for s in list_artifacts("graph")
+            if s and all(x in st.session_state.sources for x in s)
+        ]
+        if len(saved) == 1:
+            last, valid = saved[0], True
+    if valid:
+        st.session_state.selected_sources = last
     invalidate_cached_results()
     st.session_state.artifacts_restored = True
 
@@ -1045,6 +1069,11 @@ with tab_concept:
                 st.write(c["definition"])
     else:
         st.info("点击上方按钮，让AI通读文献并提取对初学者陌生的概念（约1-2分钟）。提取结果按文献范围保存，重启应用后选中它仍可直接查看。")
+        # 当前范围没有图谱，但别的范围可能已经生成过——告诉用户直接选它，别重复花钱生成
+        saved = [s for s in list_artifacts("graph") if s]
+        if saved and st.session_state.selected_sources not in saved:
+            names = "\n".join(f"- {'、'.join(s)}" for s in saved)
+            st.markdown(f"💡 **已保存过图谱的范围**（在上方下拉框选中即可直接查看，无需重新提取）：\n{names}")
 
 # --- Tab 3: 自测出题 ---
 # 一次生成一组（默认5道）：一半考所选概念，其余考相邻概念及它们与所选概念的关系。
