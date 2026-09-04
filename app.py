@@ -323,21 +323,11 @@ def render_mermaid(chart, concept_defs=None, edge_defs=None):
     n_nodes = max(chart.count('("'), 1)
     height = min(320 + 110 * n_nodes, 1500)
 
-    # 深色模式适配：跟随Streamlit会话主题（设置里切深色后Streamlit会重跑脚本，
-    # 这里拿到新主题重新渲染）。浅色是默认值。
-    is_dark = (st.context.theme.type or "light") == "dark"
-    if is_dark:
-        wrap_bg, wrap_border = "#1b2130", "#2c3547"
-        tb_bg, tb_border, tb_text, tb_hover, tb_zoom = (
-            "#232a3a", "#3a4459", "#cdd6e4", "#2e374c", "#8fa0b8")
-        node_fill, node_border, node_text = "#2b3547", "#7ea8d8", "#e6edf6"
-        line_color, edge_label_bg = "#5f7288", "#232a3a"
-    else:
-        wrap_bg, wrap_border = "#fafbfc", "#eee"
-        tb_bg, tb_border, tb_text, tb_hover, tb_zoom = (
-            "#ffffff", "#d9e2ec", "#24425c", "#eef3f8", "#667")
-        node_fill, node_border, node_text = "#eaf3fc", "#5b8fc9", "#1f2d3d"
-        line_color, edge_label_bg = "#8aa2b8", "#ffffff"
+    # 深色模式适配的实际判断在JS里做（读宿主页面真实背景亮度，见下方脚本），
+    # 这里的浅色值只作为CSS变量的兜底默认值。
+    wrap_bg, wrap_border = "#fafbfc", "#eee"
+    tb_bg, tb_border, tb_text, tb_hover, tb_zoom = (
+        "#ffffff", "#d9e2ec", "#24425c", "#eef3f8", "#667")
 
     # JS里用 textContent 去掉空白后匹配节点/边，这里预先算好每个概念的key
     import re
@@ -355,18 +345,23 @@ def render_mermaid(chart, concept_defs=None, edge_defs=None):
     render_html(
         f"""
 <style>
-  #cgraph-wrap {{ height: 100%; overflow: auto; border: 1px solid {wrap_border}; border-radius: 8px;
-                  background: {wrap_bg}; cursor: grab; }}
+  :root {{
+    --cg-wrap-bg: {wrap_bg}; --cg-wrap-border: {wrap_border};
+    --cg-tb-bg: {tb_bg}; --cg-tb-border: {tb_border}; --cg-tb-text: {tb_text};
+    --cg-tb-hover: {tb_hover}; --cg-tb-zoom: {tb_zoom};
+  }}
+  #cgraph-wrap {{ height: 100%; overflow: auto; border: 1px solid var(--cg-wrap-border); border-radius: 8px;
+                  background: var(--cg-wrap-bg); cursor: grab; }}
   #cgraph-wrap.dragging {{ cursor: grabbing; }}
   #cgraph {{ transform-origin: top left; padding: 12px; }}
   #cgraph svg {{ width: 100%; height: 100%; }}
   .cg-toolbar {{ position: sticky; top: 6px; margin-left: 6px; z-index: 10; width: fit-content;
-                background: {tb_bg}; border: 1px solid {tb_border}; border-radius: 6px;
+                background: var(--cg-tb-bg); border: 1px solid var(--cg-tb-border); border-radius: 6px;
                 box-shadow: 0 1px 4px rgba(0,0,0,.12); display: flex; }}
   .cg-toolbar button {{ border: none; background: none; padding: 4px 10px; cursor: pointer;
-                       font-size: 14px; color: {tb_text}; }}
-  .cg-toolbar button:hover {{ background: {tb_hover}; }}
-  .cg-toolbar span {{ padding: 4px 6px; font-size: 12px; color: {tb_zoom}; min-width: 38px; text-align: center; }}
+                       font-size: 14px; color: var(--cg-tb-text); }}
+  .cg-toolbar button:hover {{ background: var(--cg-tb-hover); }}
+  .cg-toolbar span {{ padding: 4px 6px; font-size: 12px; color: var(--cg-tb-zoom); min-width: 38px; text-align: center; }}
   #cgraph-tip {{ position: fixed; display: none; max-width: 320px; padding: 10px 12px;
                  background: #24425c; color: #fff; font-size: 13px; line-height: 1.6;
                  border-radius: 8px; box-shadow: 0 4px 14px rgba(0,0,0,.25); z-index: 99;
@@ -421,33 +416,73 @@ def render_mermaid(chart, concept_defs=None, edge_defs=None):
 
   const mermaid = await loadMermaid();
 
-  const baseConfig = {{
-    startOnLoad: false,
-    suppressErrorRendering: true,   // 解析失败时不让mermaid往页面里塞自带的报错图
-    securityLevel: 'antiscript',    // 概念名来自LLM输出，禁掉标签里可能夹带的脚本
-    theme: 'base',
-    flowchart: {{ nodeSpacing: 110, rankSpacing: 140, padding: 20, curve: 'linear',
-                  htmlLabels: false }},  // SVG原生text标签：PNG导出时才不会变空白
-    themeVariables: {{
-      fontSize: '30px',
-      primaryColor: '{node_fill}',
-      primaryBorderColor: '{node_border}',
-      primaryTextColor: '{node_text}',
-      lineColor: '{line_color}',
-      edgeLabelBackground: '{edge_label_bg}',
-    }},
-    themeCSS: `
-      /* 悬停反馈：只缩放节点形状（绕形状自身中心），文字不动——
-         之前对g.node全体子元素缩放时，文字的transform-origin解析不稳，
-         会出现文字向右下漂移的问题 */
-      g.node rect, g.node polygon {{ transition: transform .16s ease, filter .16s ease;
-                    transform-box: fill-box; transform-origin: center; }}
-      @media (hover: hover) and (pointer: fine) {{
-        g.node:hover rect, g.node:hover polygon {{ transform: scale(1.08); filter: brightness(0.9); }}
-      }}
-      @media (prefers-reduced-motion: reduce) {{ g.node rect, g.node polygon {{ transition: none; }} }}
-    `,
-  }};
+  // ---- 深色模式：读宿主页面(Streamlit)实际渲染的背景亮度来判断 ----
+  // 不用Streamlit的st.context.theme：它在首次加载/切换主题的瞬间可能返回旧值
+  function detectDark() {{
+    try {{
+      const doc = window.parent.document;
+      const el = doc.querySelector('[data-testid="stApp"]') || doc.body || doc.documentElement;
+      const m = getComputedStyle(el).backgroundColor.match(/\\d+/g);
+      if (!m) return false;
+      const [r, g, b] = m.map(Number);
+      return (0.299 * r + 0.587 * g + 0.114 * b) / 255 < 0.5;
+    }} catch (e) {{ return false; }}
+  }}
+  let curDark = detectDark();
+
+  function cgPalette() {{
+    return curDark ? {{
+      wrapBg: '#1b2130', nodeFill: '#2b3547', nodeBorder: '#7ea8d8', nodeText: '#e6edf6',
+      lineColor: '#5f7288', edgeLabelBg: '#232a3a',
+    }} : {{
+      wrapBg: '#fafbfc', nodeFill: '#eaf3fc', nodeBorder: '#5b8fc9', nodeText: '#1f2d3d',
+      lineColor: '#8aa2b8', edgeLabelBg: '#ffffff',
+    }};
+  }}
+  // 画布/工具栏配色通过CSS变量下发（mermaid节点配色在重渲染时生效）
+  function applyUiPalette() {{
+    const s = document.documentElement.style;
+    const dark = curDark;
+    s.setProperty('--cg-wrap-bg', dark ? '#1b2130' : '#fafbfc');
+    s.setProperty('--cg-wrap-border', dark ? '#2c3547' : '#eee');
+    s.setProperty('--cg-tb-bg', dark ? '#232a3a' : '#ffffff');
+    s.setProperty('--cg-tb-border', dark ? '#3a4459' : '#d9e2ec');
+    s.setProperty('--cg-tb-text', dark ? '#cdd6e4' : '#24425c');
+    s.setProperty('--cg-tb-hover', dark ? '#2e374c' : '#eef3f8');
+    s.setProperty('--cg-tb-zoom', dark ? '#8fa0b8' : '#667');
+  }}
+  applyUiPalette();
+
+  function baseConfig() {{
+    const p = cgPalette();
+    return {{
+      startOnLoad: false,
+      suppressErrorRendering: true,   // 解析失败时不让mermaid往页面里塞自带的报错图
+      securityLevel: 'antiscript',    // 概念名来自LLM输出，禁掉标签里可能夹带的脚本
+      theme: 'base',
+      flowchart: {{ nodeSpacing: 110, rankSpacing: 140, padding: 20, curve: 'linear',
+                    htmlLabels: false }},  // SVG原生text标签：PNG导出时才不会变空白
+      themeVariables: {{
+        fontSize: '30px',
+        primaryColor: p.nodeFill,
+        primaryBorderColor: p.nodeBorder,
+        primaryTextColor: p.nodeText,
+        lineColor: p.lineColor,
+        edgeLabelBackground: p.edgeLabelBg,
+      }},
+      themeCSS: `
+        /* 悬停反馈：只缩放节点形状（绕形状自身中心），文字不动——
+           之前对g.node全体子元素缩放时，文字的transform-origin解析不稳，
+           会出现文字向右下漂移的问题 */
+        g.node rect, g.node polygon {{ transition: transform .16s ease, filter .16s ease;
+                      transform-box: fill-box; transform-origin: center; }}
+        @media (hover: hover) and (pointer: fine) {{
+          g.node:hover rect, g.node:hover polygon {{ transform: scale(1.08); filter: brightness(0.9); }}
+        }}
+        @media (prefers-reduced-motion: reduce) {{ g.node rect, g.node polygon {{ transition: none; }} }}
+      `,
+    }};
+  }}
 
   // ELK布局引擎（GitDiagram同款）：比默认dagre的边交叉和绕线少得多，
   // 概念多、关系密的图谱可读性差距明显。本地/CDN都加载失败则退回dagre。
@@ -461,9 +496,10 @@ def render_mermaid(chart, concept_defs=None, edge_defs=None):
   }}
 
   function mermaidConfig(withElk) {{
+    const base = baseConfig();
     return withElk
-      ? {{ ...baseConfig, flowchart: {{ ...baseConfig.flowchart, defaultRenderer: 'elk' }} }}
-      : {{ ...baseConfig, flowchart: {{ ...baseConfig.flowchart, defaultRenderer: 'dagre' }} }};
+      ? {{ ...base, flowchart: {{ ...base.flowchart, defaultRenderer: 'elk' }} }}
+      : {{ ...base, flowchart: {{ ...base.flowchart, defaultRenderer: 'dagre' }} }};
   }}
   const defs = {defs_json};
   const edgeDefs = {edge_defs_json};
@@ -480,70 +516,76 @@ def render_mermaid(chart, concept_defs=None, edge_defs=None):
   }}
   function hideTip() {{ tip.style.display = 'none'; }}
 
-  try {{
-    let svg;
+  // 渲染入口独立成函数：主题切换时用当前配色整图重画
+  let renderSeq = 0;
+  async function renderChart() {{
+    const seq = ++renderSeq;
     try {{
-      // 优先ELK；个别图ELK布局器可能溢出报错，退回dagre重画一次
-      mermaid.initialize(mermaidConfig(useElk));
-      ({{ svg }} = await mermaid.render('cgraph1', {json.dumps(chart)}));
-    }} catch (err) {{
-      if (!useElk) throw err;
-      console.warn('ELK渲染失败，回退dagre', err);
-      mermaid.initialize(mermaidConfig(false));
-      ({{ svg }} = await mermaid.render('cgraph2', {json.dumps(chart)}));
-    }}
-    inner.innerHTML = svg;
-    const svgEl = inner.querySelector('svg');
-
-    // ---- 缩放与平移 ----
-    const bb = svgEl.getBBox();
-    let scale = 1;
-    function apply() {{
-      inner.style.width = bb.width * scale + 'px';
-      inner.style.height = bb.height * scale + 'px';
-      document.getElementById('zlevel').textContent = Math.round(scale * 100) + '%';
-    }}
-    // 自适应铺满容器宽度（等同fit模式），窗口尺寸变化时重新适配
-    function fitWidth() {{
-      scale = Math.min(3, Math.max(0.4, (wrap.clientWidth - 26) / bb.width));
-      apply();
-    }}
-    fitWidth();
-    window.addEventListener('resize', fitWidth);
-    function zoomBy(f) {{ scale = Math.min(3, Math.max(0.5, scale * f)); apply(); }}
-    document.getElementById('zin').onclick = () => zoomBy(1.25);
-    document.getElementById('zout').onclick = () => zoomBy(0.8);
-    document.getElementById('zreset').onclick = () => {{ wrap.scrollTo(0, 0); fitWidth(); }};
-    wrap.addEventListener('wheel', e => {{
-      e.preventDefault();
-      zoomBy(e.deltaY < 0 ? 1.15 : 0.87);
-    }}, {{ passive: false }});
-    // 拖拽平移：用Pointer事件，鼠标和平板触屏都能拖
-    let down = null;
-    wrap.addEventListener('pointerdown', e => {{
-      down = {{ x: e.clientX, y: e.clientY, l: wrap.scrollLeft, t: wrap.scrollTop }};
-      wrap.classList.add('dragging');
-    }});
-    window.addEventListener('pointermove', e => {{
-      if (!down) return;
-      wrap.scrollLeft = down.l - (e.clientX - down.x);
-      wrap.scrollTop = down.t - (e.clientY - down.y);
-    }});
-    window.addEventListener('pointerup', () => {{ down = null; wrap.classList.remove('dragging'); }});
-    // 触屏上接管手势（否则拖拽会被浏览器原生滚动抢走），鼠标端无感
-    wrap.style.touchAction = 'none';
-
-    // ---- 全屏 ----
-    document.getElementById('zfull').onclick = async () => {{
-      if (document.fullscreenElement) {{ document.exitFullscreen(); return; }}
-      try {{ await wrap.requestFullscreen(); }}
-      catch (err) {{
-        // iframe不允许真全屏时退化为页面内铺满
-        wrap.style.position = 'fixed'; wrap.style.inset = '0';
-        wrap.style.zIndex = 999; wrap.style.height = '100vh';
+      let svg;
+      try {{
+        // 优先ELK；个别图ELK布局器可能溢出报错，退回dagre重画一次
+        mermaid.initialize(mermaidConfig(useElk));
+        ({{ svg }} = await mermaid.render('cgraph' + seq + 'a', {json.dumps(chart)}));
+      }} catch (err) {{
+        if (!useElk) throw err;
+        console.warn('ELK渲染失败，回退dagre', err);
+        mermaid.initialize(mermaidConfig(false));
+        ({{ svg }} = await mermaid.render('cgraph' + seq + 'b', {json.dumps(chart)}));
       }}
-    }};
-    document.addEventListener('fullscreenchange', () => fitWidth());
+      if (seq !== renderSeq) return;  // 渲染期间又触发了重绘，丢弃过期结果
+      inner.innerHTML = svg;
+      const svgEl = inner.querySelector('svg');
+
+      // ---- 缩放与平移 ----
+      const bb = svgEl.getBBox();
+      let scale = 1;
+      function apply() {{
+        inner.style.width = bb.width * scale + 'px';
+        inner.style.height = bb.height * scale + 'px';
+        document.getElementById('zlevel').textContent = Math.round(scale * 100) + '%';
+      }}
+      // 自适应铺满容器宽度（等同fit模式），窗口尺寸变化时重新适配
+      function fitWidth() {{
+        scale = Math.min(3, Math.max(0.4, (wrap.clientWidth - 26) / bb.width));
+        apply();
+      }}
+      fitWidth();
+      // 以下全部用 on* 属性绑定（重复渲染时自动覆盖，不会叠加监听器）
+      window.onresize = fitWidth;
+      function zoomBy(f) {{ scale = Math.min(3, Math.max(0.5, scale * f)); apply(); }}
+      document.getElementById('zin').onclick = () => zoomBy(1.25);
+      document.getElementById('zout').onclick = () => zoomBy(0.8);
+      document.getElementById('zreset').onclick = () => {{ wrap.scrollTo(0, 0); fitWidth(); }};
+      wrap.onwheel = e => {{
+        e.preventDefault();
+        zoomBy(e.deltaY < 0 ? 1.15 : 0.87);
+      }};
+      // 拖拽平移：用Pointer事件，鼠标和平板触屏都能拖
+      let down = null;
+      wrap.onpointerdown = e => {{
+        down = {{ x: e.clientX, y: e.clientY, l: wrap.scrollLeft, t: wrap.scrollTop }};
+        wrap.classList.add('dragging');
+      }};
+      window.onpointermove = e => {{
+        if (!down) return;
+        wrap.scrollLeft = down.l - (e.clientX - down.x);
+        wrap.scrollTop = down.t - (e.clientY - down.y);
+      }};
+      window.onpointerup = () => {{ down = null; wrap.classList.remove('dragging'); }};
+      // 触屏上接管手势（否则拖拽会被浏览器原生滚动抢走），鼠标端无感
+      wrap.style.touchAction = 'none';
+
+      // ---- 全屏 ----
+      document.getElementById('zfull').onclick = async () => {{
+        if (document.fullscreenElement) {{ document.exitFullscreen(); return; }}
+        try {{ await wrap.requestFullscreen(); }}
+        catch (err) {{
+          // iframe不允许真全屏时退化为页面内铺满
+          wrap.style.position = 'fixed'; wrap.style.inset = '0';
+          wrap.style.zIndex = 999; wrap.style.height = '100vh';
+        }}
+      }};
+      document.onfullscreenchange = () => fitWidth();
 
     // ---- 导出PNG：SVG序列化 -> Image -> 2倍分辨率canvas下载 ----
     document.getElementById('zpng').onclick = async () => {{
@@ -566,7 +608,7 @@ def render_mermaid(chart, concept_defs=None, edge_defs=None):
         canvas.width = (bb.width + pad * 2) * scale;
         canvas.height = (bb.height + pad * 2) * scale;
         const ctx = canvas.getContext('2d');
-        ctx.fillStyle = '{wrap_bg}';  // 与页面主题同底色，深色模式下浅色节点文字才可见
+        ctx.fillStyle = cgPalette().wrapBg;  // 与页面主题同底色，深色模式下浅色节点文字才可见
         ctx.fillRect(0, 0, canvas.width, canvas.height);
         ctx.drawImage(img, pad, pad, bb.width * scale, bb.height * scale);
         const a = document.createElement('a');
@@ -592,9 +634,28 @@ def render_mermaid(chart, concept_defs=None, edge_defs=None):
       el.addEventListener('mousemove', e => showTip(txt, e));
       el.addEventListener('mouseleave', hideTip);
     }});
-  }} catch (e) {{
-    inner.textContent = '图谱渲染失败: ' + e.message;
+    }} catch (e) {{
+      inner.textContent = '图谱渲染失败: ' + e.message;
+    }}
   }}
+  await renderChart();
+
+  // 深浅色实时切换：监听宿主页面根节点的属性变化（Streamlit切主题改class/变量），
+  // 亮度反转时用新配色整图重画；跨域受限时静默放弃（仅首载时判断主题）
+  try {{
+    const pdoc = window.parent.document;
+    let deb = null;
+    const mo = new MutationObserver(() => {{
+      clearTimeout(deb);
+      deb = setTimeout(() => {{
+        const d = detectDark();
+        if (d !== curDark) {{ curDark = d; applyUiPalette(); renderChart(); }}
+      }}, 200);
+    }});
+    const opt = {{ attributes: true, attributeFilter: ['class', 'style', 'data-theme'] }};
+    mo.observe(pdoc.documentElement, opt);
+    mo.observe(pdoc.body, opt);
+  }} catch (e) {{ /* 忽略 */ }}
 </script>
 """,
         height=height,
@@ -638,10 +699,10 @@ TERM_COLORS = ["#5b8fc9", "#d29a3a", "#9a72c4", "#cd6a6a", "#4fa8a2", "#5ea575"]
 TERM_COLORS_DARK = ["#7ea9dc", "#e0b06a", "#b58fe0", "#e28b8b", "#6cc4be", "#79c393"]
 
 # 摘要排版层级：小节标题 > 段落导语 > 要点条目，字号/行距拉开方便扫读。
-# 整体基准2em（默认字号的约两倍），内部用em按层级缩放
+# 整体基准1.35em（默认字号偏小，翻倍又过大，取中间偏上），内部用em按层级缩放
 _SUMMARY_CSS = """
 <style>
-.sum-rich {{ font-size: 2em; }}
+.sum-rich {{ font-size: 1.35em; }}
 .sum-rich h2 {{
   font-size: 1.3em; font-weight: 700; line-height: 1.4;
   margin: 1.15em 0 .5em; padding: 1px 0 1px 10px;
@@ -679,7 +740,7 @@ def render_summary_markdown(text):
     def _tag_repl(m):
         label = m.group(2)
         border, bg = logic_styles.get(label, fallback)
-        return (f'{m.group(1)}<span style="display:inline-block;font-size:17px;'
+        return (f'{m.group(1)}<span style="display:inline-block;font-size:14px;'
                 f'color:{border};background:{bg};border:1px solid {border};'
                 f'border-radius:4px;padding:0 8px;margin-right:8px;'
                 f'white-space:nowrap;transform:translateY(-2px);">{label}</span>')
