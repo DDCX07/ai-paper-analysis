@@ -423,6 +423,11 @@ class QuizQuestion(BaseModel):
     explanation: str = Field(description="答案解析，口语化，说明为什么对、其他选项错在哪")
 
 
+class QuizBatch(BaseModel):
+    """一次生成的一组单选题。"""
+    questions: list[QuizQuestion] = Field(description="一组单选题")
+
+
 EXTRACT_PROMPT = """你是一位耐心的学术阅读导师。请从下面的文献片段中，提取出对初学者来说陌生的核心概念，
 以及这些概念之间的关系。要求：
 1. 只提取文献中真正出现的概念，不要自己编造；
@@ -442,6 +447,29 @@ QUIZ_PROMPT = """你是一位出题老师。请基于下面的文献内容，围
 3. 给出口语化的答案解析。
 
 概念解释：{definition}
+
+文献内容：
+{context}"""
+
+# 一组出题（一次调用生成多道，比逐题调用快数倍）：一半考概念本身，
+# 其余考与它直接相关的概念、以及它们与该概念的关系（关系来自概念图谱提取结果）
+QUIZ_BATCH_PROMPT = """你是一位出题老师。请基于下面的文献内容，围绕核心概念「{concept}」出{n}道中文单项选择题，
+组成一份小测验。要求：
+1. 题目构成：约一半考查「{concept}」本身的理解，其余考查"相关概念"里列出的概念、
+   以及它们与「{concept}」之间的关系（比如谁依赖谁、谁是谁的组成部分、效果对比）；
+2. 题干清晰，可以用大白话问；题目之间角度尽量多样（定义、作用、因果关系、对比），不要重复；
+3. 每题恰好4个选项，正确答案只有一个，干扰项要有迷惑性但不能模棱两可；
+4. 每题给出口语化的答案解析；
+5. 正确答案的位置要打散，不要连续落在同一选项；
+6. 必须通过工具提交结果，不要用纯文本回答。
+
+核心概念解释：{definition}
+
+相关概念及其定义：
+{related}
+
+与「{concept}」相关的关系：
+{relations_text}
 
 文献内容：
 {context}"""
@@ -670,29 +698,113 @@ def extract_concepts(vectorstore: Chroma, sources=None, max_chunks: int = EXTRAC
     return {"concepts": list(concept_map.values()), "relations": relations, "skipped": skipped}
 
 
-def generate_quiz(vectorstore: Chroma, concept_name: str, definition: str = "",
-                  sources=None) -> QuizQuestion:
-    """围绕指定概念，基于文献相关内容生成一道单选题。sources非空时限定文献范围。"""
-    search_kwargs = {"k": 3}
+def _invoke_stream(llm, prompt):
+    """流式调用并聚合为完整消息。长请求非流式会被网关掐断（见_invoke_text注释）；
+    聚合后的AIMessageChunk保留tool_calls，供绑工具的调用解析。"""
+    agg = None
+    for chunk in llm.stream(prompt):
+        agg = chunk if agg is None else agg + chunk
+    return agg
+
+
+def _parse_quiz_batch(message):
+    """解析出题结果，与_parse_extraction同思路：先工具调用，再从纯文本抢救JSON。"""
+    for tc in getattr(message, "tool_calls", None) or []:
+        args = tc.get("args") or {}
+        if args.get("questions"):
+            try:
+                return QuizBatch.model_validate(args)
+            except Exception:
+                logger.warning("工具参数无法解析为QuizBatch，转纯文本抢救")
+                break
+    raw = _msg_text(message).strip()
+    if not raw:
+        return None
+    m = re.search(r"```(?:json)?\s*(.+?)```", raw, re.S)
+    if m:
+        raw = m.group(1)
+    try:
+        data = json.loads(raw)
+    except Exception:
+        m = re.search(r"(\[.*\]|\{.*\})", raw, re.S)  # 抓第一个JSON数组/对象
+        if not m:
+            return None
+        try:
+            data = json.loads(m.group(1))
+        except Exception:
+            return None
+    if isinstance(data, list):
+        data = {"questions": data}
+    try:
+        return QuizBatch.model_validate(data)
+    except Exception:
+        return None
+
+
+def generate_quiz_batch(vectorstore: Chroma, concept_name: str, definition: str = "",
+                        concepts=None, relations=None, sources=None,
+                        num_questions: int = 5) -> list[QuizQuestion]:
+    """围绕指定概念出一组单选题（默认5道，单次调用生成）。
+
+    约一半考概念本身，其余考与它直接相连的概念及它们与该概念的关系
+    （来自概念图谱提取结果）。sources非空时限定文献范围。
+    """
+    # 从图谱里找出与该概念直接相连的关系与相邻概念，连同定义一起喂给出题prompt
+    rel_lines: list[str] = []
+    related_defs: dict[str, str] = {}
+    for r in relations or []:
+        if concept_name in (r.get("subject"), r.get("object")):
+            other = r["object"] if r["subject"] == concept_name else r["subject"]
+            line = f"- {r['subject']} —{r['predicate']}→ {r['object']}"
+            if line not in rel_lines:
+                rel_lines.append(line)
+            related_defs.setdefault(other, "")
+    if concepts:
+        cmap = {c["name"]: c["definition"] for c in concepts}
+        for name in related_defs:
+            related_defs[name] = cmap.get(name, "")
+    related_text = "\n".join(
+        f"- {n}：{d or '（文献中未给出明确定义）'}" for n, d in list(related_defs.items())[:5]
+    ) or "（无）"
+    relations_text = "\n".join(rel_lines[:8]) or "（未提取到与该概念直接相关的关系，题目全部围绕该概念本身出）"
+
+    # 检索范围 = 概念本身 + 相邻概念（各取少量），让关系类题目也有文献依据
     flt = _source_filter(sources)
+    base_kwargs = {"k": 3}
     if flt:
-        search_kwargs["filter"] = flt
-    docs = vectorstore.as_retriever(search_kwargs=search_kwargs).invoke(concept_name)
+        base_kwargs["filter"] = flt
+    retriever = vectorstore.as_retriever(search_kwargs=base_kwargs)
+    docs = retriever.invoke(concept_name)
+    if related_defs:
+        rel_kwargs = {"k": 1}
+        if flt:
+            rel_kwargs["filter"] = flt
+        rel_retriever = vectorstore.as_retriever(search_kwargs=rel_kwargs)
+        seen = {d.page_content for d in docs}
+        for name in list(related_defs)[:4]:
+            for d in rel_retriever.invoke(name):
+                if d.page_content not in seen:
+                    seen.add(d.page_content)
+                    docs.append(d)
     context = "\n\n".join(d.page_content for d in docs)
 
-    llm = _get_llm().with_structured_output(QuizQuestion)
-    prompt = QUIZ_PROMPT.format(
+    llm = _get_llm().bind_tools([QuizBatch])
+    prompt = QUIZ_BATCH_PROMPT.format(
         concept=concept_name,
+        n=num_questions,
         definition=definition or "（文献中未给出明确定义）",
+        related=related_text,
+        relations_text=relations_text,
         context=context,
     )
-    # 出题只有一次调用，无法跳过：失败时先重试，再不行抛出友好错误
-    quiz = None
-    for attempt in range(3):
-        quiz = llm.invoke(prompt)
-        if quiz is not None:
-            return quiz
-    raise RuntimeError("模型没有成功生成题目，请点击\"生成题目\"再试一次。")
+    # 流式保活出一次题；聚合解析失败（个别情况下流式工具调用聚合不完整）退回非流式重试
+    batch = _parse_quiz_batch(_invoke_stream(llm, prompt))
+    if batch is None or not batch.questions:
+        logger.warning("流式出题未解析出结果，退回非流式重试一次")
+        batch = _parse_quiz_batch(llm.invoke(prompt))
+    if batch is None or not batch.questions:
+        raise RuntimeError("模型没有成功生成题目，请点击\"生成题目\"再试一次。")
+    return batch.questions[:num_questions]
 
 
 # --- 测试代码 ---

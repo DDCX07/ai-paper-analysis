@@ -36,7 +36,7 @@ from rag_core import (
     get_hybrid_retriever,
     answer_question,
     extract_concepts,
-    generate_quiz,
+    generate_quiz_batch,
     generate_paper_summary,
     save_artifact,
     load_artifact,
@@ -937,14 +937,23 @@ with tab_concept:
         st.info("点击上方按钮，让AI通读文献并提取对初学者陌生的概念（约1-2分钟）。提取结果按文献范围保存，重启应用后选中它仍可直接查看。")
 
 # --- Tab 3: 自测出题 ---
+# 一次生成一组（默认5道）：一半考所选概念，其余考相邻概念及它们与所选概念的关系。
+# 题目按"考试模式"渲染：全部作答后一键交卷，统一判分+逐题解析。
+
+def _clear_quiz_choices():
+    """新一组题目作废旧作答记录（radio的key按题号固定，必须清掉否则会显示旧选项）。"""
+    for i in range(10):
+        st.session_state.pop(f"quiz_choice_{i}", None)
+
+
 with tab_quiz:
     if not st.session_state.concepts:
         st.info("请先在「🧠 概念图谱」Tab提取概念，然后在这里针对概念自测。")
     else:
         names = [c["name"] for c in st.session_state.concepts]
-        concept = st.selectbox("选择要考查的概念:", names)
+        concept = st.selectbox("选择要考查的概念（会连带考查图中与它相连的概念和关系）:", names)
 
-        if st.button("🎯 生成题目", key="quiz_btn"):
+        if st.button("🎯 生成一组题目（5道）", key="quiz_btn"):
             try:
                 definition = next(
                     (c["definition"] for c in st.session_state.concepts if c["name"] == concept), ""
@@ -952,43 +961,72 @@ with tab_quiz:
                 # 同上：session_state的值先取到局部变量再进后台线程
                 vs = st.session_state.vectorstore
                 srcs = list(st.session_state.selected_sources)
+                concept_list = st.session_state.concepts
+                relation_list = st.session_state.relations
                 st.session_state.quiz = run_with_progress_bar(
-                    lambda: generate_quiz(vs, concept, definition, sources=srcs),
-                    "正在出题...",
+                    lambda: generate_quiz_batch(
+                        vs, concept, definition,
+                        concepts=concept_list, relations=relation_list, sources=srcs,
+                    ),
+                    "正在出一组题目（5道，约1-2分钟）...",
                 )
                 st.session_state.quiz_answered = False
+                _clear_quiz_choices()
             except Exception as e:
                 st.error(f"出题失败: {e}")
 
-        quiz = st.session_state.quiz
-        if quiz is not None:
-            st.markdown(f"### 题目\n{quiz.question}")
+        quiz_list = st.session_state.quiz
+        if quiz_list:
+            answered = st.session_state.get("quiz_answered", False)
 
-            choice = st.radio(
-                "选择你的答案:",
-                quiz.options,
-                key="quiz_choice",
-                index=None,
-                disabled=st.session_state.get("quiz_answered", False),
-            )
+            if answered:
+                correct_count = sum(
+                    1 for i, q in enumerate(quiz_list)
+                    if st.session_state.get(f"quiz_choice_{i}") == q.options[q.answer_index]
+                )
+                ratio = correct_count / len(quiz_list)
+                st.markdown(
+                    f"### 🏅 得分：{correct_count} / {len(quiz_list)}"
+                    + ("　太棒了，掌握得很扎实！" if ratio >= 0.8
+                       else "　不错，再看看错题解析～" if ratio >= 0.5
+                       else "　建议回到概念图谱和问答里再巩固一下")
+                )
 
-            if not st.session_state.get("quiz_answered", False):
-                if st.button("提交答案") and choice is not None:
-                    st.session_state.quiz_answered = True
-                    st.rerun()
+            for i, q in enumerate(quiz_list):
+                st.markdown(f"### 第 {i + 1} 题")
+                st.markdown(q.question)
+                choice = st.radio(
+                    "选择你的答案:",
+                    q.options,
+                    key=f"quiz_choice_{i}",
+                    index=None,
+                    disabled=answered,
+                    label_visibility="collapsed",
+                )
+                if answered:
+                    chosen = st.session_state.get(f"quiz_choice_{i}")
+                    correct = q.options[q.answer_index]
+                    if chosen == correct:
+                        st.success("✅ 回答正确！")
+                    elif chosen is None:
+                        st.warning(f"⚠️ 这题没作答。正确答案是：{correct}")
+                    else:
+                        st.error(f"❌ 回答错误。正确答案是：{correct}")
+                    st.info(f"**解析：** {q.explanation}")
 
-            if st.session_state.get("quiz_answered", False):
-                if choice is None:
-                    # rerun后radio状态还在，重新取一次用户选择
-                    choice = st.session_state.get("quiz_choice")
-                correct = quiz.options[quiz.answer_index]
-                if choice == correct:
-                    st.success("✅ 回答正确！")
-                else:
-                    st.error(f"❌ 回答错误。正确答案是：{correct}")
-                st.info(f"**解析：** {quiz.explanation}")
+            if not answered:
+                if st.button("✅ 提交全部答案", key="quiz_submit_btn"):
+                    missing = [i + 1 for i in range(len(quiz_list))
+                               if st.session_state.get(f"quiz_choice_{i}") is None]
+                    if missing:
+                        st.warning(f"还有第 {'、'.join(map(str, missing))} 题没作答，请先选完再交卷。")
+                    else:
+                        st.session_state.quiz_answered = True
+                        st.rerun()
 
-                if st.button("再做一题"):
+            if answered:
+                if st.button("🔄 再出一组", key="quiz_again_btn"):
                     st.session_state.quiz = None
                     st.session_state.quiz_answered = False
+                    _clear_quiz_choices()
                     st.rerun()
