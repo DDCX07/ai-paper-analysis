@@ -28,20 +28,50 @@ from streamlit.components.v1 import html as render_html
 
 # rag_core的调试日志（提取失败块的信息）输出到终端，方便排查
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
-from rag_core import (
-    get_vectorstore,
-    list_sources,
-    add_pdf,
-    remove_source,
-    get_hybrid_retriever,
-    answer_question,
-    extract_concepts,
-    generate_quiz_batch,
-    generate_paper_summary,
-    save_artifact,
-    load_artifact,
-    delete_artifacts_for,
-)
+try:
+    from rag_core import (
+        get_vectorstore,
+        list_sources,
+        add_pdf,
+        remove_source,
+        get_hybrid_retriever,
+        answer_question,
+        extract_concepts,
+        generate_quiz_batch,
+        generate_paper_summary,
+        save_artifact,
+        load_artifact,
+        delete_artifacts_for,
+    )
+except RuntimeError:
+    # 首次使用者没配密钥时，rag_core会在导入时抛RuntimeError。
+    # 与其让用户看到一堆报错堆栈，这里直接渲染成一步步的配置引导。
+    st.set_page_config(page_title="📚 文献阅读助手", layout="wide")
+    st.error("## 🔑 首次使用：请先配置你的智谱 API 密钥", icon="🚨")
+    st.markdown(
+        "这个智能体由 [智谱AI开放平台](https://open.bigmodel.cn) 的大模型驱动。"
+        "**项目里不包含密钥**，每位使用者需要用自己的（新用户有免费额度）。"
+        "跟着下面三步走，一分钟搞定："
+    )
+    st.markdown(
+        "### 第 1 步：申请密钥\n"
+        "打开 [open.bigmodel.cn](https://open.bigmodel.cn) → 注册/登录 → "
+        "右上角「控制台」→ 左侧「API keys」→ **复制你的密钥**"
+    )
+    st.markdown("### 第 2 步：把密钥填进项目根目录的 `.env` 文件")
+    st.code(
+        "# 在项目根目录执行（Windows 把 cp 换成 copy）：\n"
+        "cp .env.example .env",
+        language="bash",
+    )
+    st.markdown("然后用任意文本编辑器打开 `.env`，把复制的密钥粘贴到等号右边：")
+    st.code("ZHIPU_API_KEY=粘贴你刚复制的密钥", language="ini")
+    st.markdown("### 第 3 步：重启应用\n按 Ctrl+C 停掉当前进程，重新运行启动命令，刷新本页面即可。")
+    st.info(
+        "💡 项目自带的 `.env.example` 就是密钥模板（里面有图文说明）。"
+        "`.env` 已被 .gitignore 排除，你的密钥不会被提交到 GitHub。"
+    )
+    st.stop()
 
 # --- 页面配置 ---
 st.set_page_config(page_title="📚 文献阅读助手", layout="wide")  # 铺满浏览器宽度，去掉两侧大留白
