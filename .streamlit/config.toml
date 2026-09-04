@@ -1,0 +1,3 @@
+[server]
+# 开启后 ./static 目录映射到静态路径，用于自托管mermaid与ELK布局引擎
+enableStaticServing = true

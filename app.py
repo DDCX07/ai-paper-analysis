@@ -3,10 +3,27 @@
 # 支持多文献管理：可同时上传多篇PDF入库，检索/提取/出题均可按文献来源过滤
 import json
 import logging
+import mimetypes
 import threading
 import time
 
 import streamlit as st
+
+# 自托管mermaid/ELK需要静态服务能以text/javascript返回.js/.mjs。
+# Streamlit的AppStaticFileHandler默认只给白名单扩展名真实Content-Type，
+# 其余强制text/plain并带nosniff（浏览器会拒载）。这里运行时把.js/.mjs
+# 加进白名单，并注册.mjs的MIME类型（Tornado按mimetypes猜测）。
+try:
+    import streamlit.web.server.app_static_file_handler as _asfh
+
+    if ".mjs" not in _asfh.SAFE_APP_STATIC_FILE_EXTENSIONS:
+        _asfh.SAFE_APP_STATIC_FILE_EXTENSIONS = tuple(
+            _asfh.SAFE_APP_STATIC_FILE_EXTENSIONS
+        ) + (".js", ".mjs")
+except Exception:
+    pass  # 未来版本结构变化时放弃补丁，图谱走CDN回退
+mimetypes.add_type("text/javascript", ".mjs")
+mimetypes.add_type("text/javascript", ".js")
 from streamlit.components.v1 import html as render_html
 
 # rag_core的调试日志（提取失败块的信息）输出到终端，方便排查
@@ -53,6 +70,22 @@ for k, v in DEFAULT_STATE.items():
 if st.session_state.vectorstore is None:
     st.session_state.vectorstore = get_vectorstore()
     st.session_state.sources = list_sources(st.session_state.vectorstore)
+
+
+@st.cache_data(show_spinner=False)
+def _load_source_pages(source_name: str):
+    """从向量库读取某篇文献的全部文本块并按页归组。
+
+    Streamlit每次交互都会重跑整个脚本，读库结果按文献名缓存，
+    避免翻页/切换时反复读整个向量库；文献重传或删除时手动clear()。
+    """
+    vs = get_vectorstore()
+    data = vs.get(where={"source": source_name}, include=["documents", "metadatas"])
+    pages = {}
+    for d, m in zip(data.get("documents", []), data.get("metadatas", [])):
+        if d:
+            pages.setdefault(m.get("page", 0) or 0, []).append(d.strip())
+    return pages
 
 
 def clear_cached_results():
@@ -291,7 +324,41 @@ def render_mermaid(chart, concept_defs=None, edge_defs=None):
 <div id="cgraph-wrap"><div id="cgraph"></div></div>
 <div id="cgraph-tip"></div>
 <script type="module">
-  import mermaid from 'https://registry.npmmirror.com/mermaid/11.4.1/files/dist/mermaid.esm.min.mjs';
+  // 优先加载本应用自托管的mermaid/ELK（/app/static，无外网依赖、秒加载），
+  // 取不到宿主origin或文件缺失时回退CDN，保证图谱始终能渲染
+  const origin = (() => {{
+    try {{ return window.parent.location.origin; }} catch (e) {{ return ''; }}
+  }})();
+
+  async function loadMermaid() {{
+    if (origin) {{
+      try {{
+        await new Promise((res, rej) => {{
+          const s = document.createElement('script');
+          s.src = origin + '/app/static/mermaid/mermaid.min.js';
+          s.onload = res;
+          s.onerror = () => rej(new Error('local failed'));
+          document.head.appendChild(s);
+        }});
+        if (window.mermaid) return window.mermaid;
+      }} catch (e) {{ /* 回退CDN */ }}
+    }}
+    return (await import(
+      'https://registry.npmmirror.com/mermaid/11.4.1/files/dist/mermaid.esm.min.mjs'
+    )).default;
+  }}
+
+  async function loadElkLayouts() {{
+    const urls = [];
+    if (origin) urls.push(origin + '/app/static/mermaid/elk.mjs');
+    urls.push('https://cdn.jsdelivr.net/npm/@mermaid-js/layout-elk@0.2.1/dist/mermaid-layout-elk.esm.min.mjs');
+    for (const u of urls) {{
+      try {{ return (await import(u)).default; }} catch (e) {{ /* 试下一个来源 */ }}
+    }}
+    return null;
+  }}
+
+  const mermaid = await loadMermaid();
 
   const baseConfig = {{
     startOnLoad: false,
@@ -320,16 +387,15 @@ def render_mermaid(chart, concept_defs=None, edge_defs=None):
   }};
 
   // ELK布局引擎（GitDiagram同款）：比默认dagre的边交叉和绕线少得多，
-  // 概念多、关系密的图谱可读性差距明显。CDN上npmmirror不提供该包，
-  // 走jsdelivr；加载失败则静默退回dagre，图谱照样能画。
+  // 概念多、关系密的图谱可读性差距明显。本地/CDN都加载失败则退回dagre。
   let useElk = false;
-  try {{
-    const elkLayouts = (await import(
-      'https://cdn.jsdelivr.net/npm/@mermaid-js/layout-elk@0.2.1/dist/mermaid-layout-elk.esm.min.mjs'
-    )).default;
+  const elkLayouts = await loadElkLayouts();
+  if (elkLayouts) {{
     mermaid.registerLayoutLoaders(elkLayouts);
     useElk = true;
-  }} catch (err) {{ console.warn('ELK布局加载失败，使用默认dagre布局', err); }}
+  }} else {{
+    console.warn('ELK布局加载失败，使用默认dagre布局');
+  }}
 
   function mermaidConfig(withElk) {{
     return withElk
@@ -506,6 +572,7 @@ with st.sidebar:
                         st.session_state.vectorstore, f, f.name, progress_callback=scoped
                     )
                 st.session_state.sources = list_sources(st.session_state.vectorstore)
+                _load_source_pages.clear()  # 文献内容变了，阅读器缓存作废
                 invalidate_cached_results()  # 尝试恢复与本次范围匹配的剩余缓存
                 fade_out_progress(bar, f"✅ 完成！共入库 {total_chunks} 块")
                 st.success(f"✅ {len(uploaded_files)} 篇文献处理完成！")
@@ -522,6 +589,7 @@ with st.sidebar:
                 if victim in st.session_state.selected_sources:
                     st.session_state.selected_sources.remove(victim)
                 st.session_state.sources = list_sources(st.session_state.vectorstore)
+                _load_source_pages.clear()
                 invalidate_cached_results()
                 st.rerun()
         else:
@@ -533,13 +601,7 @@ with st.sidebar:
             view_src = st.selectbox(
                 "选择文献:", st.session_state.sources, key="view_source"
             )
-            data = st.session_state.vectorstore.get(
-                where={"source": view_src}, include=["documents", "metadatas"]
-            )
-            pages = {}
-            for d, m in zip(data.get("documents", []), data.get("metadatas", [])):
-                if d:
-                    pages.setdefault(m.get("page", 0) or 0, []).append(d.strip())
+            pages = _load_source_pages(view_src)
             if not pages:
                 st.caption("该文献没有可展示的文本")
             else:
@@ -605,13 +667,20 @@ if choice != current_label:
 filter_label = "、".join(st.session_state.selected_sources) if st.session_state.selected_sources else "全部文献"
 st.caption(f"当前范围：**{filter_label}**（也可在左侧多选多篇检索）")
 
-# 检索范围变化时重建混合检索器（BM25索引随过滤范围变化，缓存避免每问重建）
+# 混合检索器惰性构建：不再在每次页面加载时同步重建BM25索引（拉全部文本块+jieba
+# 分词要1-2秒，会让切换文献时整页卡住），改成第一次提问时才建，之后按范围缓存
 sources_key = tuple(st.session_state.selected_sources)
-if st.session_state.retriever is None or st.session_state.retriever_key != sources_key:
-    st.session_state.retriever = get_hybrid_retriever(
-        st.session_state.vectorstore, sources=list(st.session_state.selected_sources)
-    )
-    st.session_state.retriever_key = sources_key
+
+
+def ensure_retriever():
+    """确保检索器与当前检索范围匹配；需要新建时在提问处显示提示。"""
+    if st.session_state.retriever is None or st.session_state.retriever_key != sources_key:
+        with st.spinner("正在建立检索索引（首次提问需1-2秒）..."):
+            st.session_state.retriever = get_hybrid_retriever(
+                st.session_state.vectorstore,
+                sources=list(st.session_state.selected_sources),
+            )
+            st.session_state.retriever_key = sources_key
 
 tab_summary, tab_qa, tab_concept, tab_quiz = st.tabs(
     ["📋 论文速读", "📖 问答", "🧠 概念图谱", "📝 自测出题"]
@@ -671,6 +740,7 @@ with tab_qa:
         question = st.session_state.messages[-1]["content"]
         with st.chat_message("assistant"):
             try:
+                ensure_retriever()  # 首次提问时才建索引，页面加载不必等它
                 with st.spinner("正在思考..."):
                     result = answer_question(
                     st.session_state.vectorstore,
