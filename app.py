@@ -87,6 +87,18 @@ def make_progress_bar(label="准备中..."):
     return bar, callback
 
 
+def fade_out_progress(bar, text="✅ 完成！"):
+    """进度条走完后的淡化效果：进度条消失，完成提示以动画淡到低亮度，
+    不再有大块进度条一直杵在页面上（CSS动画随下次rerun自然清除）。"""
+    bar.empty()
+    st.markdown(
+        f'<div style="color:#1a7f37;font-size:0.9em;'
+        f'animation:cg_progress_fade 2.5s ease 0.5s forwards;">{text}</div>'
+        f'<style>@keyframes cg_progress_fade {{ to {{ opacity: 0.35; }} }}</style>',
+        unsafe_allow_html=True,
+    )
+
+
 def run_with_progress_bar(fn, label):
     """执行单次LLM调用类任务（没有可回报的中间进度）。
 
@@ -115,7 +127,7 @@ def run_with_progress_bar(fn, label):
     if "error" in holder:
         bar.progress(1.0, text=f"{label} — 失败")
         raise holder["error"]
-    bar.progress(1.0, text=f"{label} — 完成！")
+    fade_out_progress(bar, f"✅ {label} — 完成！")
     return holder["value"]
 
 
@@ -495,7 +507,7 @@ with st.sidebar:
                     )
                 st.session_state.sources = list_sources(st.session_state.vectorstore)
                 invalidate_cached_results()  # 尝试恢复与本次范围匹配的剩余缓存
-                bar.progress(1.0, text=f"✅ 完成！共入库 {total_chunks} 块")
+                fade_out_progress(bar, f"✅ 完成！共入库 {total_chunks} 块")
                 st.success(f"✅ {len(uploaded_files)} 篇文献处理完成！")
             except Exception as e:
                 st.error(f"处理失败: {e}")
@@ -507,6 +519,8 @@ with st.sidebar:
             if st.button("删除该文献", use_container_width=True):
                 remove_source(st.session_state.vectorstore, victim)
                 delete_artifacts_for([victim])  # 引用它的摘要/图谱缓存一并作废
+                if victim in st.session_state.selected_sources:
+                    st.session_state.selected_sources.remove(victim)
                 st.session_state.sources = list_sources(st.session_state.vectorstore)
                 invalidate_cached_results()
                 st.rerun()
@@ -563,8 +577,33 @@ if not st.session_state.sources:
     st.info("👈 请先在左侧上传PDF文献并点击「处理并入库」。知识库持久化保存，重启应用也不用重新上传。")
     st.stop()
 
+# --- 文献导航：选中单篇即可查看/生成它的摘要与概念图谱（未生成则显示生成按钮） ---
+sel = st.session_state.selected_sources
+if len(sel) == 1 and sel[0] in st.session_state.sources:
+    current_label = sel[0]
+elif not sel:
+    current_label = "（全部文献）"
+else:
+    current_label = "（多选范围）"
+
+browse_options = ["（全部文献）"] + st.session_state.sources
+if current_label == "（多选范围）":
+    browse_options.append("（多选范围）")  # 占位，避免侧边栏多选时下拉框无处落脚
+choice = st.selectbox(
+    "📚 选择文献（摘要 / 概念图谱 / 问答都会针对这个范围）:",
+    browse_options,
+    index=browse_options.index(current_label),
+    key="browse_source",
+)
+if choice != current_label:
+    st.session_state.selected_sources = (
+        [] if choice in ("（全部文献）", "（多选范围）") else [choice]
+    )
+    invalidate_cached_results()  # 自动切换到该范围已保存的摘要/图谱缓存
+    st.rerun()
+
 filter_label = "、".join(st.session_state.selected_sources) if st.session_state.selected_sources else "全部文献"
-st.caption(f"当前检索范围：**{filter_label}**")
+st.caption(f"当前范围：**{filter_label}**（也可在左侧多选多篇检索）")
 
 # 检索范围变化时重建混合检索器（BM25索引随过滤范围变化，缓存避免每问重建）
 sources_key = tuple(st.session_state.selected_sources)
@@ -598,7 +637,7 @@ with tab_summary:
     if st.session_state.summary:
         st.markdown(st.session_state.summary)
     else:
-        st.info("点击上方按钮生成全文速读（模型会先深度思考，约需 1-2 分钟）。切换检索范围后摘要会重新生成。")
+        st.info("选中上方文献后点击按钮生成（模型会先深度思考，约需 1-2 分钟）。生成结果按文献范围保存，下次选中它直接显示，无需重新生成。")
 
 # --- Tab 1: 问答（多轮对话） ---
 with tab_qa:
@@ -666,7 +705,7 @@ with tab_concept:
                 sources=list(st.session_state.selected_sources),
                 progress_callback=callback,
             )
-            bar.progress(1.0, text="✅ 提取完成")
+            fade_out_progress(bar, "✅ 提取完成")
             st.session_state.concepts = res["concepts"]
             st.session_state.relations = res["relations"]
             st.session_state.quiz = None  # 概念变了，旧题目作废
@@ -718,7 +757,7 @@ with tab_concept:
             with st.expander(f"**{c['name']}**"):
                 st.write(c["definition"])
     else:
-        st.info("点击上方按钮，让AI通读文献并提取对初学者陌生的概念。")
+        st.info("点击上方按钮，让AI通读文献并提取对初学者陌生的概念（约1-2分钟）。提取结果按文献范围保存，重启应用后选中它仍可直接查看。")
 
 # --- Tab 3: 自测出题 ---
 with tab_quiz:
