@@ -16,6 +16,7 @@ import jieba
 from langchain_core.documents import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_anthropic import ChatAnthropic
+from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import OpenAIEmbeddings
 from langchain_chroma import Chroma
@@ -24,21 +25,32 @@ from langchain_community.retrievers import BM25Retriever
 from langchain.retrievers import EnsembleRetriever
 
 # --- 配置 ---
+# 厂商无关：接口地址/密钥/模型名全部从.env读取，不写死任何一家。
+# 默认预设为智谱GLM；换DeepSeek/Kimi/通义/OpenAI等只需改.env（示例见.env.example）。
 load_dotenv()  # 读取项目根目录的 .env 文件
-API_KEY = os.environ.get("ZHIPU_API_KEY", "")
+
+# 密钥：LLM_API_KEY优先，兼容旧名ZHIPU_API_KEY
+API_KEY = os.environ.get("LLM_API_KEY", "").strip() or os.environ.get("ZHIPU_API_KEY", "").strip()
 if not API_KEY:
     raise RuntimeError(
-        "未找到智谱API密钥：请在项目根目录创建 .env 文件并写入 "
-        "ZHIPU_API_KEY=你的密钥（可参考 .env.example）"
+        "未找到API密钥：请在项目根目录创建 .env 文件，填入 LLM_API_KEY=你的密钥"
+        "（接口地址/模型名等完整示例见 .env.example）"
     )
 
-# GLM的Anthropic兼容端点（chat用）
-ANTHROPIC_BASE_URL = "https://open.bigmodel.cn/api/anthropic"
-LLM_MODEL = "glm-5.3-flash"
+# 对话模型三要素。LLM_API_TYPE决定接口协议：
+#   anthropic（默认，智谱Anthropic兼容端点）/ openai（OpenAI兼容端点，多数厂商用这个）
+LLM_API_TYPE = os.environ.get("LLM_API_TYPE", "anthropic").strip().lower()
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://open.bigmodel.cn/api/anthropic").strip()
+LLM_MODEL = os.environ.get("LLM_MODEL", "glm-5.3-flash").strip()
+# 输出上限。智谱GLM强制思考，thinking块要占两三千token，必须给足余量；
+# 其他厂商若报max_tokens超限（如部分模型上限8k），可在.env里调小
+LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "16384"))
 
-# 智谱的OpenAI兼容端点（embedding用）
-OPENAI_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
-EMBEDDING_MODEL = "embedding-3"
+# Embedding模型（走OpenAI兼容接口，允许用另一家厂商）。
+# EMBEDDING_API_KEY不填则复用LLM_API_KEY
+EMBEDDING_BASE_URL = os.environ.get("EMBEDDING_BASE_URL", "https://open.bigmodel.cn/api/paas/v4").strip()
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "embedding-3").strip()
+EMBEDDING_API_KEY = os.environ.get("EMBEDDING_API_KEY", "").strip() or API_KEY
 
 # 学术文献用较大分块效果更好（参考DeepSeek方案中的调优建议）
 CHUNK_SIZE = 1000
@@ -58,37 +70,40 @@ logger = logging.getLogger("rag_core")
 
 
 def _get_embeddings() -> OpenAIEmbeddings:
-    """智谱 embedding-3，走OpenAI兼容端点。
+    """Embedding模型，走OpenAI兼容端点（默认智谱embedding-3，可换厂商）。
 
     check_embedding_ctx_length=False 很关键：关闭后不做tiktoken本地分词
-    （那是OpenAI专用逻辑），直接把整段文本发给智谱接口。
+    （那是OpenAI专用逻辑），直接把整段文本发给接口。
     """
     return OpenAIEmbeddings(
         model=EMBEDDING_MODEL,
-        api_key=API_KEY,
-        base_url=OPENAI_BASE_URL,
+        api_key=EMBEDDING_API_KEY,
+        base_url=EMBEDDING_BASE_URL,
         check_embedding_ctx_length=False,
     )
 
 
-def _get_llm() -> ChatAnthropic:
-    """GLM对话模型，走Anthropic兼容端点。
+def _get_llm():
+    """对话模型。默认智谱GLM走Anthropic兼容端点；.env里 LLM_API_TYPE=openai
+    时改走OpenAI兼容端点（DeepSeek/Kimi/通义/OpenAI等）。
 
-    智谱新策略：glm-5.3-flash始终思考，传disabled会报1210错误，
+    智谱专用逻辑（anthropic分支）：glm-5.3-flash始终思考，传disabled会报1210错误，
     只能开思考并给最小budget（1024）压低延迟。
     注意：thinking块本身能占到两三千token，max_tokens必须给足余量，
     否则思考没结束就截断，text块为空。
-    返回内容里会多一个thinking块，各调用方统一用_msg_text取纯文本，不受影响。
+    返回内容里可能多一个thinking块，各调用方统一用_msg_text取纯文本，不受影响。
     """
-    return ChatAnthropic(
+    common = dict(
         model=LLM_MODEL,
         api_key=API_KEY,
-        base_url=ANTHROPIC_BASE_URL,
-        max_tokens=16384,
+        base_url=LLM_BASE_URL,
+        max_tokens=LLM_MAX_TOKENS,
         temperature=0.2,
         timeout=120,
-        thinking={"type": "enabled", "budget_tokens": 1024},
     )
+    if LLM_API_TYPE == "openai":
+        return ChatOpenAI(**common)
+    return ChatAnthropic(**common, thinking={"type": "enabled", "budget_tokens": 1024})
 
 
 def _source_filter(sources):
@@ -810,6 +825,7 @@ def generate_quiz_batch(vectorstore: Chroma, concept_name: str, definition: str 
 # --- 测试代码 ---
 if __name__ == "__main__":
     print("RAG Core module loaded.")
-    print("LLM:", LLM_MODEL, "| Embedding:", EMBEDDING_MODEL)
+    print("LLM:", LLM_MODEL, f"({LLM_API_TYPE} @ {LLM_BASE_URL})",
+          "| Embedding:", EMBEDDING_MODEL, f"(@ {EMBEDDING_BASE_URL})")
     vs = get_vectorstore()
     print("已入库文献:", list_sources(vs) or "（空）")

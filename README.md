@@ -4,13 +4,24 @@
 
 ## 🚀 快速开始
 
-### 第 0 步：配置你的 API 密钥（必做！）
+### 第 0 步：配置模型服务（必做！）
 
-> **⚠️ 本项目不包含 API 密钥**——模型能力由 [智谱AI开放平台](https://open.bigmodel.cn) 提供，
-> 每位使用者需要自己申请（新用户有免费额度）。没配密钥的话，启动应用后会显示配置引导页。
+> **⚠️ 本项目不包含 API 密钥**——每位使用者需要自己申请（多数厂商新用户有免费额度）。
+> 没配的话，启动应用后会显示配置引导页。
 
-1. **申请密钥**：打开 [open.bigmodel.cn](https://open.bigmodel.cn) → 注册/登录 → 「控制台」→「API keys」→ 复制密钥
-2. **填入密钥**：在项目根目录，把模板文件 **`.env.example`** 复制一份并重命名为 **`.env`**，然后把你的密钥粘贴进去：
+需要填三样东西：**接口地址、API密钥、模型名**。默认使用智谱GLM，也支持 DeepSeek / Kimi / 通义千问 / OpenAI 等 OpenAI 或 Anthropic 兼容接口的厂商。
+
+1. **申请密钥**：去厂商开放平台注册并创建 API key，同时记下它的**接口地址（base_url）**和**模型名**：
+
+   | 厂商 | 申请/文档地址 | 协议（LLM_API_TYPE） | 模型名示例 |
+   | --- | --- | --- | --- |
+   | 智谱GLM（默认） | [open.bigmodel.cn](https://open.bigmodel.cn) | `anthropic` | `glm-5.3-flash` |
+   | DeepSeek | [platform.deepseek.com](https://platform.deepseek.com) | `openai` | `deepseek-chat` |
+   | Kimi | [platform.moonshot.cn](https://platform.moonshot.cn) | `openai` | `moonshot-v1-32k` |
+   | 通义千问 | [dashscope.console.aliyun.com](https://dashscope.console.aliyun.com) | `openai` | `qwen-plus` |
+   | OpenAI | [platform.openai.com](https://platform.openai.com) | `openai` | `gpt-4o-mini` |
+
+2. **填入配置**：在项目根目录，把模板文件 **`.env.example`** 复制一份并重命名为 **`.env`**：
 
    ```bash
    # macOS / Linux
@@ -19,13 +30,18 @@
    copy .env.example .env
    ```
 
-   打开 `.env`，改成这样（等号右边换成你自己的密钥）：
+   打开 `.env`，把开头四行改成你选的厂商（以智谱为例）：
 
    ```ini
-   ZHIPU_API_KEY=粘贴你刚复制的密钥
+   LLM_BASE_URL=https://open.bigmodel.cn/api/anthropic   # 接口地址
+   LLM_API_TYPE=anthropic                                # 接口协议：anthropic 或 openai
+   LLM_API_KEY=粘贴你刚复制的密钥                          # API密钥
+   LLM_MODEL=glm-5.3-flash                               # 模型名
    ```
 
-3. `.env` 已被 `.gitignore` 排除，**你的密钥只留在自己电脑上，不会被提交到 GitHub**。
+3. **Embedding 说明**：文献入库/检索用 embedding 模型，默认智谱 `embedding-3`。对话模型换厂商后可以不改；也可以改用同厂商的 embedding（改 `.env` 里的 `EMBEDDING_*` 三项，见 `.env.example` 内说明）。注意 DeepSeek 没有 embedding 接口。
+
+4. `.env` 已被 `.gitignore` 排除，**你的密钥只留在自己电脑上，不会被提交到 GitHub**。
 
 ### 第 1 步：安装依赖
 
@@ -72,6 +88,6 @@ python run_app.py run app.py --server.port 8501
 
 ## ❓ 常见问题
 
-- **启动后一直显示配置引导页**：说明 `.env` 没建好或 `ZHIPU_API_KEY` 还是模板占位文字，回到「第 0 步」检查。
+- **启动后一直显示配置引导页**：说明 `.env` 没建好，或 `LLM_API_KEY` 还是模板占位文字，回到「第 0 步」检查。
 - **改了 `.env` 还是提示没密钥**：改完需要重启应用（Ctrl+C 后重新运行启动命令）。
 - **图谱加载慢**：确认是用 `python run_app.py run app.py` 启动的（见第 2 步说明）。

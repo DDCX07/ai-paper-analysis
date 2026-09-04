@@ -47,28 +47,41 @@ except RuntimeError:
     # 首次使用者没配密钥时，rag_core会在导入时抛RuntimeError。
     # 与其让用户看到一堆报错堆栈，这里直接渲染成一步步的配置引导。
     st.set_page_config(page_title="📚 文献阅读助手", layout="wide")
-    st.error("## 🔑 首次使用：请先配置你的智谱 API 密钥", icon="🚨")
+    st.error("## 🔑 首次使用：请先在 `.env` 中配置你的模型服务", icon="🚨")
     st.markdown(
-        "这个智能体由 [智谱AI开放平台](https://open.bigmodel.cn) 的大模型驱动。"
-        "**项目里不包含密钥**，每位使用者需要用自己的（新用户有免费额度）。"
-        "跟着下面三步走，一分钟搞定："
+        "本项目默认使用智谱GLM，也支持 **DeepSeek、Kimi、通义千问、OpenAI 等任何兼容接口的厂商**。"
+        "**项目里不包含密钥**，每位使用者需要自己申请。要填的就是三样东西："
+        "**接口地址、API密钥、模型名**，跟着下面三步走，一分钟搞定："
     )
     st.markdown(
-        "### 第 1 步：申请密钥\n"
-        "打开 [open.bigmodel.cn](https://open.bigmodel.cn) → 注册/登录 → "
-        "右上角「控制台」→ 左侧「API keys」→ **复制你的密钥**"
+        "### 第 1 步：去厂商开放平台申请密钥\n"
+        "注册/登录后，在控制台里创建 API key 并复制，同时记下它的**接口地址（base_url）**"
+        "和**模型名**（都在厂商文档的\"接口说明\"里）。常见厂商：\n\n"
+        "| 厂商 | 申请/文档地址 | 协议 | 模型名示例 |\n"
+        "| --- | --- | --- | --- |\n"
+        "| 智谱GLM（默认） | [open.bigmodel.cn](https://open.bigmodel.cn) | anthropic | `glm-5.3-flash` |\n"
+        "| DeepSeek | [platform.deepseek.com](https://platform.deepseek.com) | openai | `deepseek-chat` |\n"
+        "| Kimi | [platform.moonshot.cn](https://platform.moonshot.cn) | openai | `moonshot-v1-32k` |\n"
+        "| 通义千问 | [dashscope.console.aliyun.com](https://dashscope.console.aliyun.com) | openai | `qwen-plus` |\n"
+        "| OpenAI | [platform.openai.com](https://platform.openai.com) | openai | `gpt-4o-mini` |"
     )
-    st.markdown("### 第 2 步：把密钥填进项目根目录的 `.env` 文件")
+    st.markdown("### 第 2 步：把三项配置填进项目根目录的 `.env` 文件")
     st.code(
         "# 在项目根目录执行（Windows 把 cp 换成 copy）：\n"
         "cp .env.example .env",
         language="bash",
     )
-    st.markdown("然后用任意文本编辑器打开 `.env`，把复制的密钥粘贴到等号右边：")
-    st.code("ZHIPU_API_KEY=粘贴你刚复制的密钥", language="ini")
+    st.markdown("然后用任意文本编辑器打开 `.env`，把开头的四行改成你选的厂商：")
+    st.code(
+        "LLM_BASE_URL=https://open.bigmodel.cn/api/anthropic   # 接口地址\n"
+        "LLM_API_TYPE=anthropic                                # 接口协议：anthropic 或 openai\n"
+        "LLM_API_KEY=粘贴你刚复制的密钥                          # API密钥\n"
+        "LLM_MODEL=glm-5.3-flash                               # 模型名",
+        language="ini",
+    )
     st.markdown("### 第 3 步：重启应用\n按 Ctrl+C 停掉当前进程，重新运行启动命令，刷新本页面即可。")
     st.info(
-        "💡 项目自带的 `.env.example` 就是密钥模板（里面有图文说明）。"
+        "💡 `.env.example` 里有全部常见厂商的地址/模型速查表，复制对应几行即可切换厂商；"
         "`.env` 已被 .gitignore 排除，你的密钥不会被提交到 GitHub。"
     )
     st.stop()
