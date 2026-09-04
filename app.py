@@ -280,6 +280,22 @@ def render_mermaid(chart, concept_defs=None, edge_defs=None):
     n_nodes = max(chart.count('("'), 1)
     height = min(320 + 90 * n_nodes, 1200)
 
+    # 深色模式适配：跟随Streamlit会话主题（设置里切深色后Streamlit会重跑脚本，
+    # 这里拿到新主题重新渲染）。浅色是默认值。
+    is_dark = (st.context.theme.type or "light") == "dark"
+    if is_dark:
+        wrap_bg, wrap_border = "#1b2130", "#2c3547"
+        tb_bg, tb_border, tb_text, tb_hover, tb_zoom = (
+            "#232a3a", "#3a4459", "#cdd6e4", "#2e374c", "#8fa0b8")
+        node_fill, node_border, node_text = "#2b3547", "#7ea8d8", "#e6edf6"
+        line_color, edge_label_bg = "#5f7288", "#232a3a"
+    else:
+        wrap_bg, wrap_border = "#fafbfc", "#eee"
+        tb_bg, tb_border, tb_text, tb_hover, tb_zoom = (
+            "#ffffff", "#d9e2ec", "#24425c", "#eef3f8", "#667")
+        node_fill, node_border, node_text = "#eaf3fc", "#5b8fc9", "#1f2d3d"
+        line_color, edge_label_bg = "#8aa2b8", "#ffffff"
+
     # JS里用 textContent 去掉空白后匹配节点/边，这里预先算好每个概念的key
     import re
 
@@ -296,18 +312,18 @@ def render_mermaid(chart, concept_defs=None, edge_defs=None):
     render_html(
         f"""
 <style>
-  #cgraph-wrap {{ height: 100%; overflow: auto; border: 1px solid #eee; border-radius: 8px;
-                  background: #fafbfc; cursor: grab; }}
+  #cgraph-wrap {{ height: 100%; overflow: auto; border: 1px solid {wrap_border}; border-radius: 8px;
+                  background: {wrap_bg}; cursor: grab; }}
   #cgraph-wrap.dragging {{ cursor: grabbing; }}
   #cgraph {{ transform-origin: top left; padding: 12px; }}
   #cgraph svg {{ width: 100%; height: 100%; }}
   .cg-toolbar {{ position: sticky; top: 6px; margin-left: 6px; z-index: 10; width: fit-content;
-                background: #fff; border: 1px solid #d9e2ec; border-radius: 6px;
+                background: {tb_bg}; border: 1px solid {tb_border}; border-radius: 6px;
                 box-shadow: 0 1px 4px rgba(0,0,0,.12); display: flex; }}
   .cg-toolbar button {{ border: none; background: none; padding: 4px 10px; cursor: pointer;
-                       font-size: 14px; color: #24425c; }}
-  .cg-toolbar button:hover {{ background: #eef3f8; }}
-  .cg-toolbar span {{ padding: 4px 6px; font-size: 12px; color: #667; min-width: 38px; text-align: center; }}
+                       font-size: 14px; color: {tb_text}; }}
+  .cg-toolbar button:hover {{ background: {tb_hover}; }}
+  .cg-toolbar span {{ padding: 4px 6px; font-size: 12px; color: {tb_zoom}; min-width: 38px; text-align: center; }}
   #cgraph-tip {{ position: fixed; display: none; max-width: 320px; padding: 10px 12px;
                  background: #24425c; color: #fff; font-size: 13px; line-height: 1.6;
                  border-radius: 8px; box-shadow: 0 4px 14px rgba(0,0,0,.25); z-index: 99;
@@ -369,11 +385,11 @@ def render_mermaid(chart, concept_defs=None, edge_defs=None):
                   htmlLabels: false }},  // SVG原生text标签：PNG导出时才不会变空白
     themeVariables: {{
       fontSize: '15px',
-      primaryColor: '#eaf3fc',
-      primaryBorderColor: '#5b8fc9',
-      primaryTextColor: '#1f2d3d',
-      lineColor: '#8aa2b8',
-      edgeLabelBackground: '#ffffff',
+      primaryColor: '{node_fill}',
+      primaryBorderColor: '{node_border}',
+      primaryTextColor: '{node_text}',
+      lineColor: '{line_color}',
+      edgeLabelBackground: '{edge_label_bg}',
     }},
     themeCSS: `
       /* 悬停反馈（参考GitDiagram）：轻微放大+压暗，提示"这个节点可以悬停看定义" */
@@ -503,7 +519,7 @@ def render_mermaid(chart, concept_defs=None, edge_defs=None):
         canvas.width = (bb.width + pad * 2) * scale;
         canvas.height = (bb.height + pad * 2) * scale;
         const ctx = canvas.getContext('2d');
-        ctx.fillStyle = '#ffffff';
+        ctx.fillStyle = '{wrap_bg}';  // 与页面主题同底色，深色模式下浅色节点文字才可见
         ctx.fillRect(0, 0, canvas.width, canvas.height);
         ctx.drawImage(img, pad, pad, bb.width * scale, bb.height * scale);
         const a = document.createElement('a');
@@ -536,6 +552,96 @@ def render_mermaid(chart, concept_defs=None, edge_defs=None):
 """,
         height=height,
     )
+
+
+# --- 摘要富文本渲染：逻辑关系徽章 + 术语同色下划线 ---
+# 与rag_core.SUMMARY_PROMPT的输出约定对应：每条要点以「逻辑词」开头，
+# 关键术语用[[术语]]标记；旧版无标记的摘要也能正常渲染（正则不匹配就原样通过）
+
+# 逻辑词 -> (文字/边框色, 背景色)，语义近似的意思色系相近：问题/转折偏红，方案/结果偏绿
+# 深色模式单独一套：底色换成深色调、文字提亮，否则浅色徽章在深底上刺眼
+LOGIC_STYLES = {
+    "问题": ("#cd6a6a", "#fdeaea"),
+    "转折": ("#cd6a6a", "#fdeaea"),
+    "因果": ("#d29a3a", "#fdf3e0"),
+    "对比": ("#4fa8a2", "#eaf7f6"),
+    "并列": ("#5b8fc9", "#eaf3fc"),
+    "递进": ("#9a72c4", "#f3ecfa"),
+    "目的": ("#5ea575", "#e8f6ec"),
+    "方法": ("#5b8fc9", "#eaf3fc"),
+    "方案": ("#5ea575", "#e8f6ec"),
+    "结果": ("#5ea575", "#e8f6ec"),
+    "补充": ("#7d8aa0", "#eef0f4"),
+}
+LOGIC_STYLES_DARK = {
+    "问题": ("#e28b8b", "#3a2528"),
+    "转折": ("#e28b8b", "#3a2528"),
+    "因果": ("#e0b06a", "#39301d"),
+    "对比": ("#6cc4be", "#1c3331"),
+    "并列": ("#7ea9dc", "#1f2c3e"),
+    "递进": ("#b58fe0", "#2f2440"),
+    "目的": ("#79c393", "#1d3327"),
+    "方法": ("#7ea9dc", "#1f2c3e"),
+    "方案": ("#79c393", "#1d3327"),
+    "结果": ("#79c393", "#1d3327"),
+    "补充": ("#9aa7bd", "#2a3140"),
+}
+# 术语下划线轮换色：同一术语固定同一颜色，同色即同词，扫一眼就能追踪指代
+TERM_COLORS = ["#5b8fc9", "#d29a3a", "#9a72c4", "#cd6a6a", "#4fa8a2", "#5ea575"]
+TERM_COLORS_DARK = ["#7ea9dc", "#e0b06a", "#b58fe0", "#e28b8b", "#6cc4be", "#79c393"]
+
+# 摘要排版层级：小节标题 > 段落导语 > 要点条目，字号/行距拉开方便扫读
+_SUMMARY_CSS = """
+<style>
+.sum-rich h2 {{
+  font-size: 1.3em; font-weight: 700; line-height: 1.4;
+  margin: 1.15em 0 .5em; padding: 1px 0 1px 10px;
+  border-left: 4px solid {accent};
+}}
+.sum-rich p {{ font-size: 1em; line-height: 1.75; margin: .15em 0 .7em; }}
+.sum-rich ul {{ margin: .2em 0 .9em; }}
+.sum-rich li {{ font-size: .94em; line-height: 1.8; margin: .3em 0; }}
+</style>
+"""
+
+
+def render_summary_markdown(text):
+    """把摘要渲染成富文本：「逻辑词」-> 徽章，[[术语]] -> 彩色下划线，
+    并按 小节标题/导语/要点 做字号层级。深色模式自动换配色。"""
+    import re
+
+    is_dark = (st.context.theme.type or "light") == "dark"
+    logic_styles = LOGIC_STYLES_DARK if is_dark else LOGIC_STYLES
+    term_colors_palette = TERM_COLORS_DARK if is_dark else TERM_COLORS
+    fallback = logic_styles["补充"]
+
+    # 先转义再注入受控的span，摘要文本里若混入<>&不会破坏页面结构
+    esc = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    term_colors = {}
+    def _term_repl(m):
+        term = m.group(1)
+        if term not in term_colors:
+            term_colors[term] = term_colors_palette[len(term_colors) % len(term_colors_palette)]
+        c = term_colors[term]
+        return (f'<span style="font-weight:600;border-bottom:2.5px solid {c};'
+                f'padding-bottom:1px;">{term}</span>')
+
+    def _tag_repl(m):
+        label = m.group(2)
+        border, bg = logic_styles.get(label, fallback)
+        return (f'{m.group(1)}<span style="display:inline-block;font-size:12px;'
+                f'color:{border};background:{bg};border:1px solid {border};'
+                f'border-radius:4px;padding:0 6px;margin-right:6px;'
+                f'white-space:nowrap;transform:translateY(-1px);">{label}</span>')
+
+    esc = re.sub(r"\[\[(.+?)\]\]", _term_repl, esc)
+    esc = re.sub(r"^(\s*(?:[-*]\s*)?)「([^」]{1,4})」", _tag_repl, esc, flags=re.M)
+
+    # 用div包一层做排版作用域（div后留空行，后面的内容仍走markdown解析）
+    css = _SUMMARY_CSS.format(accent="#7ea9dc" if is_dark else "#5b8fc9")
+    st.markdown(css + '<div class="sum-rich">\n\n' + esc + "\n\n</div>",
+                unsafe_allow_html=True)
 
 
 # --- 侧边栏：文献库管理与来源过滤 ---
@@ -704,7 +810,8 @@ with tab_summary:
             st.error(f"摘要生成失败: {e}")
 
     if st.session_state.summary:
-        st.markdown(st.session_state.summary)
+        render_summary_markdown(st.session_state.summary)
+        st.caption("💡 要点前的彩色标签是逻辑关系（问题/因果/转折/并列/对比…）；带色下划线的是关键术语，同色=同一术语，全文只标第一次出现。")
     else:
         st.info("选中上方文献后点击按钮生成（模型会先深度思考，约需 1-2 分钟）。生成结果按文献范围保存，下次选中它直接显示，无需重新生成。")
 

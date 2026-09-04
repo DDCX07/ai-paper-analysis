@@ -370,9 +370,8 @@ def answer_question(vectorstore: Chroma, question: str, history: list = None,
         f"{'用户' if t['role'] == 'user' else '助手'}：{t['content'][:300]}\n" for t in turns
     ) or "（无）"
 
-    answer = _msg_text(_get_llm().invoke(
-        CONV_QA_PROMPT.format(history=hist_text, context=context, question=question)
-    )).strip()
+    answer = _invoke_text(_get_llm(),
+                          CONV_QA_PROMPT.format(history=hist_text, context=context, question=question))
     return {"answer": answer or "（模型未返回内容，请重试。）", "source_documents": docs}
 
 
@@ -448,18 +447,25 @@ QUIZ_PROMPT = """你是一位出题老师。请基于下面的文献内容，围
 {context}"""
 
 # 结构化摘要（"读论文模式"）
-SUMMARY_PROMPT = """你是一位帮初学者精读论文的导师。请基于下面的文献内容，输出一份Markdown格式的结构化摘要，
-必须包含以下四个二级标题，每个部分3-6句话，用通俗但不失准确的语言：
-## 研究背景
-这篇论文要解决什么问题？现有方法的不足是什么？
-## 核心创新点
-论文提出了什么新方法/新视角？与已有工作的关键区别是什么？
-## 方法论
-方法的主要流程和关键模块（可保留关键公式的LaTeX写法，用 $...$ 包裹）。
-## 实验结论
-数据集/任务、主要结果数字、以及论文自己承认的局限。
+# 输出约定（app.py的render_summary_markdown会把这些标记渲染成图形样式）：
+#   - 每条要点以「逻辑词」开头 -> 渲染成彩色徽章
+#   - 关键术语用[[术语]]包裹 -> 渲染成同色下划线高亮
+SUMMARY_PROMPT = """你是一位帮初学者精读论文的导师。请基于下面的文献内容，输出一份Markdown格式的结构化摘要。
 
-要求：只基于文献内容，不要编造；文献中缺失的部分直接写"文献中未明确提及"。
+格式要求（必须严格遵守）：
+1. 必须包含以下四个二级标题。每部分先用一句话概括，然后换行用列表展开3-6条要点（每条以"- "开头）：
+## 研究背景
+## 核心创新点
+## 方法论
+## 实验结论
+2. 每条要点的最开头用「」标出这条要点承担的逻辑角色，只能从下面这些词里选最贴切的一个：
+   「问题」「方案」「因果」「转折」「并列」「递进」「对比」「目的」「方法」「结果」「补充」
+   示例：- 「因果」因为RNN要逐帧计算，所以训练无法并行，速度很慢。
+3. 关键概念/术语/模型名/评价指标，第一次出现时用双方括号包起来，如 [[自注意力]]、[[Transformer]]；
+   同一个术语全文只在第一次出现时标注一次，不要整句标注，普通词不要标。
+4. 语言通俗但不失准确，可以用大白话解释；关键公式用 $...$ 包裹。
+5. 只基于文献内容，不要编造；文献中缺失的部分直接写"文献中未明确提及"。
+6. 直接输出Markdown，不要输出任何解释或前言。
 
 文献内容：
 {context}"""
@@ -494,7 +500,7 @@ def generate_paper_summary(vectorstore: Chroma, sources=None, max_chunks: int = 
     report(0.2, f"已采样 {len(sampled)} 块，正在精读...")
 
     llm = _get_llm()
-    summary = _msg_text(llm.invoke(SUMMARY_PROMPT.format(context=context))).strip()
+    summary = _invoke_text(llm, SUMMARY_PROMPT.format(context=context))
     report(1.0, "摘要生成完成！")
     return summary or "（模型未返回内容，请重试。）"
 
@@ -534,6 +540,21 @@ def _msg_text(message) -> str:
         if isinstance(b, dict) and b.get("type") == "text":
             parts.append(b.get("text", ""))
     return "".join(parts)
+
+
+def _invoke_text(llm, prompt) -> str:
+    """流式调用并拼接纯文本回复。
+
+    GLM强制思考后，长请求在非流式下会长时间一个字节都不返回，
+    实测超过若干分钟会被网关/中间链路以ReadTimeout掐断（小请求秒回，无此问题）。
+    流式传输持续有增量到达，连接不会被判定空闲；对调用方仍然是拿到完整文本。
+    """
+    parts = []
+    for chunk in llm.stream(prompt):
+        t = _msg_text(chunk)
+        if t:
+            parts.append(t)
+    return "".join(parts).strip()
 
 
 def _parse_extraction(message):
