@@ -321,7 +321,7 @@ def render_mermaid(chart, concept_defs=None, edge_defs=None):
     mermaid本体CDN用npmmirror（国内实测比jsdelivr快一个量级）。
     """
     n_nodes = max(chart.count('("'), 1)
-    height = min(320 + 90 * n_nodes, 1200)
+    height = min(320 + 110 * n_nodes, 1500)
 
     # 深色模式适配：跟随Streamlit会话主题（设置里切深色后Streamlit会重跑脚本，
     # 这里拿到新主题重新渲染）。浅色是默认值。
@@ -380,8 +380,10 @@ def render_mermaid(chart, concept_defs=None, edge_defs=None):
   <button id="zfull" title="全屏查看">⛶ 全屏</button>
   <button id="zpng" title="导出PNG图片">📷 PNG</button>
 </div>
-<div id="cgraph-wrap"><div id="cgraph"></div></div>
-<div id="cgraph-tip"></div>
+<div id="cgraph-wrap"><div id="cgraph"></div>
+  <!-- 提示卡片必须放在wrap内部：全屏时浏览器只渲染全屏元素的子树，放在外面会消失 -->
+  <div id="cgraph-tip"></div>
+</div>
 <script type="module">
   // 优先加载本应用自托管的mermaid/ELK（/app/static，无外网依赖、秒加载），
   // 取不到宿主origin或文件缺失时回退CDN，保证图谱始终能渲染
@@ -424,10 +426,10 @@ def render_mermaid(chart, concept_defs=None, edge_defs=None):
     suppressErrorRendering: true,   // 解析失败时不让mermaid往页面里塞自带的报错图
     securityLevel: 'antiscript',    // 概念名来自LLM输出，禁掉标签里可能夹带的脚本
     theme: 'base',
-    flowchart: {{ nodeSpacing: 75, rankSpacing: 95, padding: 14, curve: 'linear',
+    flowchart: {{ nodeSpacing: 110, rankSpacing: 140, padding: 20, curve: 'linear',
                   htmlLabels: false }},  // SVG原生text标签：PNG导出时才不会变空白
     themeVariables: {{
-      fontSize: '15px',
+      fontSize: '30px',
       primaryColor: '{node_fill}',
       primaryBorderColor: '{node_border}',
       primaryTextColor: '{node_text}',
@@ -435,13 +437,15 @@ def render_mermaid(chart, concept_defs=None, edge_defs=None):
       edgeLabelBackground: '{edge_label_bg}',
     }},
     themeCSS: `
-      /* 悬停反馈（参考GitDiagram）：轻微放大+压暗，提示"这个节点可以悬停看定义" */
-      g.node > * {{ transition: transform .16s ease, filter .16s ease;
+      /* 悬停反馈：只缩放节点形状（绕形状自身中心），文字不动——
+         之前对g.node全体子元素缩放时，文字的transform-origin解析不稳，
+         会出现文字向右下漂移的问题 */
+      g.node rect, g.node polygon {{ transition: transform .16s ease, filter .16s ease;
                     transform-box: fill-box; transform-origin: center; }}
       @media (hover: hover) and (pointer: fine) {{
-        g.node:hover > * {{ transform: scale(1.05); filter: brightness(0.92); }}
+        g.node:hover rect, g.node:hover polygon {{ transform: scale(1.08); filter: brightness(0.9); }}
       }}
-      @media (prefers-reduced-motion: reduce) {{ g.node > * {{ transition: none; }} }}
+      @media (prefers-reduced-motion: reduce) {{ g.node rect, g.node polygon {{ transition: none; }} }}
     `,
   }};
 
@@ -633,9 +637,11 @@ LOGIC_STYLES_DARK = {
 TERM_COLORS = ["#5b8fc9", "#d29a3a", "#9a72c4", "#cd6a6a", "#4fa8a2", "#5ea575"]
 TERM_COLORS_DARK = ["#7ea9dc", "#e0b06a", "#b58fe0", "#e28b8b", "#6cc4be", "#79c393"]
 
-# 摘要排版层级：小节标题 > 段落导语 > 要点条目，字号/行距拉开方便扫读
+# 摘要排版层级：小节标题 > 段落导语 > 要点条目，字号/行距拉开方便扫读。
+# 整体基准2em（默认字号的约两倍），内部用em按层级缩放
 _SUMMARY_CSS = """
 <style>
+.sum-rich {{ font-size: 2em; }}
 .sum-rich h2 {{
   font-size: 1.3em; font-weight: 700; line-height: 1.4;
   margin: 1.15em 0 .5em; padding: 1px 0 1px 10px;
@@ -673,10 +679,10 @@ def render_summary_markdown(text):
     def _tag_repl(m):
         label = m.group(2)
         border, bg = logic_styles.get(label, fallback)
-        return (f'{m.group(1)}<span style="display:inline-block;font-size:12px;'
+        return (f'{m.group(1)}<span style="display:inline-block;font-size:17px;'
                 f'color:{border};background:{bg};border:1px solid {border};'
-                f'border-radius:4px;padding:0 6px;margin-right:6px;'
-                f'white-space:nowrap;transform:translateY(-1px);">{label}</span>')
+                f'border-radius:4px;padding:0 8px;margin-right:8px;'
+                f'white-space:nowrap;transform:translateY(-2px);">{label}</span>')
 
     esc = re.sub(r"\[\[(.+?)\]\]", _term_repl, esc)
     esc = re.sub(r"^(\s*(?:[-*]\s*)?)「([^」]{1,4})」", _tag_repl, esc, flags=re.M)
